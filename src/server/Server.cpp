@@ -329,10 +329,10 @@ namespace vx::mcp {
         response["jsonrpc"] = "2.0";
         response["id"] = request["id"];
         response["result"]["protocolVersion"] = request["params"]["protocolVersion"];
-
-        response["result"]["capabilities"]["tools"] = json::object();
-        response["result"]["capabilities"]["prompts"] = json::object();
+        response["result"]["capabilities"]["tools"] = json::object({{"listChanged", true}});
+        response["result"]["capabilities"]["prompts"] = json::object({{"listChanged", true}});
         response["result"]["capabilities"]["resources"]["subscribe"] = true;
+        response["result"]["capabilities"]["resources"]["listChanged"] = true;
         response["result"]["capabilities"]["logging"] = json::object();
         response["result"]["serverInfo"]["name"] = name_;
         response["result"]["serverInfo"]["version"] = PROJECT_VERSION;
