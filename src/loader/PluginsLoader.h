@@ -78,13 +78,13 @@ namespace vx::mcp {
         void StopWatching();
     
     private:
-        enum class LoadState {
+        enum class LoadResult {
             kSuccess,
             kLoadFailed,
             kSourceChangedDuringCopy,
         };
         
-        std::shared_ptr<PluginEntry> CreatePluginInstance(const std::string& path, LoadState& result);
+        std::shared_ptr<PluginEntry> CreatePluginInstance(const std::string& path, LoadResult& result);
         std::string CopyToStaging(const std::string& originPath);
 
         void EnsureStagingDir(const std::string& pluginsDirectory);
