@@ -23,12 +23,14 @@ struct NotificationState{
 };
 NotificationState notificationState;
 
-void stop_handler(sig_atomic_t s){
+void stop_handler(sig_atomic_t s) {
+    std::cout <<"Stopping server..." << std::endl;
     g_stopRequest = 1;
-    std::cout << "Stopping server..." << std::endl;
-    if(server){
-        server->RequestStop();
+    if (server && server->IsValid()) {
+        server->Stop();
     }
+    std::cout << "done." << std::endl;
+    exit(0);
 }
 
 void ClientNotificationCallbackImpl(const char* pluginName, const char* notification){
