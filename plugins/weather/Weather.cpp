@@ -12,7 +12,7 @@ static PluginTool methods[] {
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
             "properties": {
-                "latitude": {"type": "string},
+                "latitude": {"type": "string"},
                 "longitude": {"type": "string"},
                 "city": {"type": "string"}
             }, 
