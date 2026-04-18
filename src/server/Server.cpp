@@ -244,7 +244,7 @@ namespace vx::mcp {
             LOG(DEBUG) << "=== Request END ===" << std::endl;
         }
         if(!request.contains("method")){
-            return MCPBuilder::Error(MCPBuilder::InvalidRequest, request["id"], "Missing method");
+            return nullptr;
         }
         std::string methodName = request["method"];
         auto it = functionMap.find(methodName);
@@ -259,13 +259,19 @@ namespace vx::mcp {
                 return response;
             }
         }
-        int id = request["id"];
-        return MCPBuilder::Error(MCPBuilder::MethodNotFound, std::to_string(id), "Method not found");
+        if (request.contains("id")) {
+            std::string idStr;
+            if (request["id"].is_string()) idStr = request["id"].get<std::string>();
+            else if (request["id"].is_number()) idStr = std::to_string(request["id"].get<int>());
+            else idStr = "null";
+            return MCPBuilder::Error(MCPBuilder::MethodNotFound, idStr, "Method not found");
+        }
+        return nullptr;
     }
 
     bool Server::OverrideCallback(const std::string& method, std::function<json(const json&)> function){
         if(functionMap.find(method) != functionMap.end()){
-            functionMap[method] = function;
+            functionMap[method] = std::move(function);
             return true;
         }
         return false;
@@ -328,8 +334,12 @@ namespace vx::mcp {
         }
         nlohmann::ordered_json response = {};
         response["jsonrpc"] = "2.0";
-        response["id"] = request["id"];
-        response["result"]["protocolVersion"] = request["params"]["protocolVersion"];
+        if (request.contains("id")) response["id"] = request["id"];
+        std::string pVer = "2024-11-05";
+        if (request.contains("params") && request["params"].contains("protocolVersion")) {
+            pVer = request["params"]["protocolVersion"].get<std::string>();
+        }
+        response["result"]["protocolVersion"] = pVer;
         response["result"]["capabilities"]["tools"] = json::object({{"listChanged", true}});
         response["result"]["capabilities"]["prompts"] = json::object({{"listChanged", true}});
         response["result"]["capabilities"]["resources"]["subscribe"] = true;
