@@ -3,20 +3,22 @@
 
 /**
  * @file StreamableTransport.h
- * @brief MCP Streamable HTTP 传输层 (2025-03-26 规范)
+ * @brief MCP Streamable HTTP Transport (2025-03-26 Spec)
  *
- * 实现 MCP 规范中的 Streamable HTTP 传输协议：
- *   - POST /mcp  — 接收 JSON-RPC 消息，动态返回 application/json 或 text/event-stream
- *   - GET  /mcp  — 建立 SSE 长连接，接收服务器主动通知
- *   - DELETE /mcp — 销毁会话
+ * Implements the Streamable HTTP transport protocol from the MCP spec:
+ *   - POST /mcp  — Receives JSON-RPC messages, dynamically returns
+ *                   application/json or text/event-stream
+ *   - GET  /mcp  — Establishes an SSE long-lived connection for server notifications
+ *   - DELETE /mcp — Destroys the session
  *
- * 关键特性：
- *   1. 动态响应策略：根据客户端 Accept 头和应用层决策，自动切换普通 JSON 响应与 SSE 流式响应
- *   2. 标准 SSE 格式：严格遵循 event: message + data: {json} 规范
- *   3. 会话管理：通过 MCP-Session-Id HTTP Header 实现会话识别
- *   4. 线程安全：核心队列和连接状态均使用互斥锁保护
+ * Key features:
+ *   1. Dynamic response strategy: automatically switches between JSON and SSE
+ *      streaming based on the client's Accept header and application-layer decision
+ *   2. Standard SSE format: strictly follows event: message + data: {json} spec
+ *   3. Session management: client identification via MCP-Session-Id HTTP header
+ *   4. Thread safety: core queues and connection state protected by mutexes
  *
- * 设计约束：单客户端场景
+ * Design constraint: single-client scenario
  */
 
 #include "ITransport.h"
@@ -39,51 +41,51 @@ namespace vx::transport {
 
     /**
      * @class StreamableTransport
-     * @brief 符合 MCP 2025-03-26 Streamable HTTP 规范的传输层实现
+     * @brief MCP 2025-03-26 Streamable HTTP transport implementation
      *
-     * 继承 ITransport 接口，通过 cpp-httplib 构建 HTTP 服务端，
-     * 支持客户端以 POST 方式发送 JSON-RPC 消息，并通过 Accept 头
-     * 指示期望的响应格式（JSON 或 SSE 流）。
+     * Inherits the ITransport interface and builds an HTTP server via cpp-httplib.
+     * Supports clients sending JSON-RPC messages via POST, with the Accept header
+     * indicating the desired response format (JSON or SSE stream).
      */
     class StreamableTransport : public ITransport {
     public:
         /**
-         * @brief 构造函数
-         * @param port  HTTP 监听端口
-         * @param host  绑定地址
-         * @param endpoint  API 端点路径（默认 "/mcp"）
+         * @brief Constructor
+         * @param port      HTTP listening port
+         * @param host      Bind address
+         * @param endpoint  API endpoint path (default "/mcp")
          */
         explicit StreamableTransport(int port = 8080,
                                      std::string host = "0.0.0.0",
                                      std::string endpoint = "/mcp");
         ~StreamableTransport();
 
-        // 禁用拷贝和移动
+        // Disable copy and move
         StreamableTransport(const StreamableTransport&) = delete;
         StreamableTransport(StreamableTransport&&) = delete;
         StreamableTransport& operator=(const StreamableTransport&) = delete;
         StreamableTransport& operator=(StreamableTransport&&) = delete;
 
-        // ========== ITransport 接口 ==========
+        // ========== ITransport Interface ==========
 
         bool Start() override;
         void Stop() override;
         bool IsRunning() override { return running_.load(); }
 
         /**
-         * @brief 阻塞式读取一条来自客户端的 JSON-RPC 消息
-         * @return {长度, JSON 字符串}，停止时返回 {0, ""}
+         * @brief Blocking read of a JSON-RPC message from the client
+         * @return {length, JSON string}; returns {0, ""} when stopped
          */
         std::pair<size_t, std::string> Read() override;
 
         /**
-         * @brief 将服务器响应/通知写回客户端
+         * @brief Write a server response or notification back to the client
          *
-         * 路由逻辑：
-         *   - 如果是某个待处理请求的响应（含 id + result/error）：
-        *     · JSON 模式：通过 promise 回传给等待的 POST handler
-        *     · SSE 模式：通过 DataSink 推送 SSE 事件
-         *   - 如果是服务器通知（无 id）：推送到 GET SSE 流
+         * Routing logic:
+         *   - If it is a response to a pending request (has id + result/error):
+         *     · JSON mode: returns result via promise to the waiting POST handler
+         *     · SSE mode: pushes SSE event via DataSink
+         *   - If it is a server notification (no id): pushed to the GET SSE stream
          */
         void Write(const std::string& json_data) override;
 
@@ -95,114 +97,116 @@ namespace vx::transport {
         int GetPort() override { return port_; }
 
     private:
-        // ========== 响应模式枚举 ==========
+        // ========== Response Mode Enum ==========
 
         /**
-         * @brief POST 请求的响应模式
-         *   - JSON: 返回 application/json（快速响应）
-         *   - SSE:  升级为 text/event-stream（流式响应）
+         * @brief Response mode for a POST request
+         *   - JSON: returns application/json (fast response)
+         *   - SSE:  upgrades to text/event-stream (streaming response)
          */
         enum class ResponseMode {
-            JSON,   ///< 标准 JSON 响应
-            SSE     ///< Server-Sent Events 流式响应
+            JSON,   ///< Standard JSON response
+            SSE     ///< Server-Sent Events streaming response
         };
 
-        // ========== 待处理请求结构 ==========
+        // ========== Pending Request Structure ==========
 
         /**
-         * @brief 跟踪一个已入队但尚未完成的 POST 请求
+         * @brief Tracks a POST request that has been enqueued but not yet completed
          *
-         * 当 POST /mcp 收到一个带 id 的请求时，创建此结构。
-         * Server 层处理完毕后通过 Write() 回调，将结果分发给
-         * 对应的响应通道（JSON promise 或 SSE sink）。
+         * Created when POST /mcp receives a request with an id.
+         * After the Server layer finishes processing, Write() dispatches the
+         * result to the corresponding response channel (JSON promise or SSE sink).
          */
         struct PendingRequest {
-            ResponseMode mode;                          ///< 响应模式
-            std::promise<std::string> json_promise;     ///< JSON 模式：结果通过 future 返回
-            httplib::DataSink* sse_sink{nullptr};        ///< SSE 模式：结果通过 sink 推送（非拥有指针，生命周期由 httplib 管理）
-            std::mutex sink_mutex;                      ///< 保护 sse_sink 的并发访问
-            std::atomic<bool> stream_active{false};     ///< SSE 流是否仍然活跃
+            ResponseMode mode;                          ///< Response mode
+            std::promise<std::string> json_promise;     ///< JSON mode: result returned via future
+            httplib::DataSink* sse_sink{nullptr};        ///< SSE mode: result pushed via sink (non-owning pointer, lifetime managed by httplib)
+            std::mutex sink_mutex;                      ///< Protects sse_sink from concurrent access
+            std::atomic<bool> stream_active{false};     ///< Whether the SSE stream is still active
         };
 
-        // ========== 路由与处理器 ==========
+        // ========== Routes and Handlers ==========
 
-        /** @brief 注册 HTTP 路由 */
+        /** @brief Register HTTP routes */
         void SetupRoutes();
 
         /**
-         * @brief 处理 POST /mcp 请求
+         * @brief Handle POST /mcp requests
          *
-         * 解析 JSON-RPC 消息，根据 Accept 头和消息类型决定响应策略：
-         *   - 通知消息 (无 id) → 返回 202 Accepted
-         *   - 请求消息 (有 id) → 入队等待 Server 处理，然后返回 JSON 或 SSE
+         * Parses the JSON-RPC message and determines the response strategy
+         * based on the Accept header and message type:
+         *   - Notification (no id) → returns 202 Accepted
+         *   - Request (has id) → enqueues for Server processing, then returns JSON or SSE
          */
         void HandlePostMessage(const httplib::Request& req, httplib::Response& res);
 
         /**
-         * @brief 处理 GET /mcp 请求 — SSE 长连接
+         * @brief Handle GET /mcp requests — SSE long-lived connection
          *
-         * 建立 SSE 事件流，用于接收服务器主动推送的通知和流式事件。
-         * 客户端必须携带有效的 MCP-Session-Id。
+         * Establishes an SSE event stream for receiving server-pushed
+         * notifications and streaming events.
+         * Client must carry a valid MCP-Session-Id.
          */
         void HandleGetSSE(const httplib::Request& req, httplib::Response& res);
 
         /**
-         * @brief 处理 DELETE /mcp 请求 — 销毁会话
+         * @brief Handle DELETE /mcp requests — session teardown
          */
         void HandleDeleteSession(const httplib::Request& req, httplib::Response& res);
 
-        /** @brief 处理 OPTIONS 预检请求 (CORS) */
+        /** @brief Handle OPTIONS preflight requests (CORS) */
         static void HandleOptionsRequest(const httplib::Request& req, httplib::Response& res);
 
-        /** @brief 设置 CORS 响应头 */
+        /** @brief Set CORS response headers */
         static void SetCORSHeaders(httplib::Response& res);
 
         /**
-         * @brief 验证请求中的 MCP-Session-Id
-         * @return true 验证通过，false 验证失败（已设置 404 响应）
+         * @brief Validate the MCP-Session-Id in the request
+         * @return true if validation passes; false if it fails (404 response already set)
          */
         bool ValidateSession(const httplib::Request& req, httplib::Response& res) const;
 
         /**
-         * @brief 判断客户端是否接受 SSE 流式响应
-         * @return true 客户端 Accept 头包含 text/event-stream
+         * @brief Check if the client accepts SSE streaming responses
+         * @return true if the client's Accept header contains text/event-stream
          */
         static bool ClientAcceptsSSE(const httplib::Request& req);
 
         /**
-         * @brief 格式化 SSE 事件
-         * @param data JSON 数据字符串
-         * @return 符合规范的 SSE 事件文本: "event: message\ndata: {data}\n\n"
+         * @brief Format an SSE event
+         * @param data JSON data string
+         * @return SSE-formatted text: "event: message\ndata: {data}\n\n"
          */
         static std::string FormatSSEEvent(const std::string& data);
 
-        // ========== 成员变量 ==========
+        // ========== Member Variables ==========
 
-        // HTTP 服务
-        std::unique_ptr<httplib::Server> server_;   ///< cpp-httplib 服务实例
-        std::thread server_thread_;                  ///< 服务监听线程
-        std::atomic<bool> running_{false};           ///< 服务运行状态
+        // HTTP server
+        std::unique_ptr<httplib::Server> server_;   ///< cpp-httplib server instance
+        std::thread server_thread_;                  ///< Server listener thread
+        std::atomic<bool> running_{false};           ///< Server running state
 
-        // 配置
-        int port_;                  ///< 监听端口
-        std::string host_;          ///< 绑定地址
-        std::string endpoint_;      ///< API 端点路径
+        // Configuration
+        int port_;                  ///< Listening port
+        std::string host_;          ///< Bind address
+        std::string endpoint_;      ///< API endpoint path
 
-        // 单客户端会话
-        std::string session_id_;                ///< 当前会话 ID
-        bool session_initialized_{false};       ///< 会话是否已初始化
-        std::atomic<bool> client_connected_{false}; ///< 客户端是否已连接
+        // Single-client session
+        std::string session_id_;                ///< Current session ID
+        bool session_initialized_{false};       ///< Whether the session has been initialized
+        std::atomic<bool> client_connected_{false}; ///< Whether the client is connected
 
-        // 入站消息队列 (POST → Server::Read() 消费)
+        // Inbound message queue (POST → Server::Read() consumer)
         std::queue<std::string> incoming_queue_;
         std::mutex incoming_mutex_;
         std::condition_variable incoming_cv_;
 
-        // 待处理请求映射 (request id → PendingRequest)
+        // Pending request map (request id → PendingRequest)
         std::unordered_map<std::string, std::shared_ptr<PendingRequest>> pending_requests_;
         std::mutex pending_mutex_;
 
-        // GET /mcp SSE 通知通道 (服务器主动推送)
+        // GET /mcp SSE notification channel (server-pushed)
         std::queue<std::string> sse_notifications_;
         std::mutex sse_mutex_;
         std::condition_variable sse_cv_;

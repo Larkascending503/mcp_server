@@ -1,12 +1,12 @@
 /**
  * @file StreamableTransport.cpp
- * @brief MCP Streamable HTTP 传输层实现 (2025-03-26 规范)
+ * @brief MCP Streamable HTTP Transport Implementation (2025-03-26 Spec)
  *
- * 实现细节：
- *   1. POST /mcp — 动态响应策略（JSON / SSE 流式切换）
- *   2. GET  /mcp — SSE 长连接，接收服务器通知
- *   3. DELETE /mcp — 会话销毁
- *   4. CORS 预检处理
+ * Implementation details:
+ *   1. POST /mcp — Dynamic response strategy (JSON / SSE stream switching)
+ *   2. GET  /mcp — SSE long-lived connection for server notifications
+ *   3. DELETE /mcp — Session teardown
+ *   4. CORS preflight handling
  */
 
 #include "StreamableTransport.h"
@@ -14,7 +14,7 @@
 namespace vx::transport {
 
     // =========================================================================
-    // 构造 / 析构
+    // Construction / Destruction
     // =========================================================================
 
     StreamableTransport::StreamableTransport(int port, std::string host, std::string endpoint)
@@ -31,7 +31,7 @@ namespace vx::transport {
     }
 
     // =========================================================================
-    // ITransport 生命周期
+    // ITransport Lifecycle
     // =========================================================================
 
     bool StreamableTransport::Start() {
@@ -50,7 +50,7 @@ namespace vx::transport {
             }
         });
 
-        // 等待服务启动
+        // Wait for server to start
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         return running_.load();
     }
@@ -62,26 +62,20 @@ namespace vx::transport {
 
         LOG(INFO) << "Stopping Streamable HTTP server..." << std::endl;
 
-        // 通知所有等待的线程
+        // Notify all waiting threads
         client_connected_.store(false);
         sse_stream_active_.store(false);
         incoming_cv_.notify_all();
         sse_cv_.notify_all();
 
-        // 停止 HTTP 服务
-        if (server_) {
-            server_->stop();
-        }
-
-        // 等待服务线程退出
-        if (server_thread_.joinable()) {
-            server_thread_.join();
-        }
-
-        // 清理所有待处理请求：设置空值让 future 解除阻塞
+        // Fix: Clean up pending_requests_ BEFORE calling server_->stop().
+        // server_->stop() blocks until all HTTP handler threads exit. If a
+        // handler is blocked on response_future.wait_for(30s), it must be
+        // unblocked first; otherwise we deadlock for up to 30 seconds.
         {
             std::lock_guard<std::mutex> lock(pending_mutex_);
             for (auto& [id, pending] : pending_requests_) {
+                pending->stream_active.store(false);
                 try {
                     pending->json_promise.set_value("");
                 } catch (const std::exception& e) {
@@ -92,11 +86,21 @@ namespace vx::transport {
             pending_requests_.clear();
         }
 
+        // Stop HTTP server (all handler futures have been resolved above)
+        if (server_) {
+            server_->stop();
+        }
+
+        // Wait for the listener thread to exit
+        if (server_thread_.joinable()) {
+            server_thread_.join();
+        }
+
         LOG(INFO) << "Streamable HTTP server stopped" << std::endl;
     }
 
     // =========================================================================
-    // ITransport 读写接口
+    // ITransport Read / Write Interface
     // =========================================================================
 
     std::pair<size_t, std::string> StreamableTransport::Read() {
@@ -132,9 +136,9 @@ namespace vx::transport {
         try {
             auto parsed = nlohmann::json::parse(json_data);
 
-            // --- 路由判断：是某个请求的响应还是服务器通知？ ---
+            // --- Routing: is this a response to a pending request or a server notification? ---
 
-            // 条件：含 id 且含 result 或 error → 这是某个 POST 请求的响应
+            // Condition: has "id" AND has "result" or "error" → response to a POST request
             if (parsed.contains("id") && (parsed.contains("result") || parsed.contains("error"))) {
                 std::string id_str;
                 if (parsed["id"].is_number()) {
@@ -151,11 +155,11 @@ namespace vx::transport {
                     auto& pending = it->second;
 
                     if (pending->mode == ResponseMode::JSON) {
-                        // ---- JSON 模式：通过 promise 回传给 POST handler ----
+                        // ---- JSON mode: resolve the promise to return the response ----
                         LOG(DEBUG) << "[Streamable] Resolving JSON response for request " << id_str << std::endl;
                         pending->json_promise.set_value(json_data);
                     } else {
-                        // ---- SSE 模式：通过 DataSink 推送 SSE 事件 ----
+                        // ---- SSE mode: push the SSE event via DataSink ----
                         std::lock_guard<std::mutex> sink_lock(pending->sink_mutex);
                         if (pending->stream_active.load() && pending->sse_sink != nullptr) {
                             std::string sse_event = FormatSSEEvent(json_data);
@@ -173,7 +177,7 @@ namespace vx::transport {
                 }
             }
 
-            // --- 不是请求响应 → 视为服务器通知，推送到 GET SSE 流 ---
+            // --- Not a request response → treat as server notification, push to GET SSE stream ---
             if (sse_stream_active_.load()) {
                 std::lock_guard<std::mutex> lock(sse_mutex_);
                 sse_notifications_.push(json_data);
@@ -195,31 +199,31 @@ namespace vx::transport {
     }
 
     // =========================================================================
-    // 路由注册
+    // Route Registration
     // =========================================================================
 
     void StreamableTransport::SetupRoutes() {
-        // CORS 预检
+        // CORS preflight
         server_->Options("/.*", [](const httplib::Request& req, httplib::Response& res) {
             HandleOptionsRequest(req, res);
         });
 
-        // 健康检查
+        // Health check
         server_->Get("/health", [](const httplib::Request& req, httplib::Response& res) {
             res.set_content(R"({"status":"ok","transport":"streamable-http"})", "application/json");
         });
 
-        // POST /mcp — 接收 JSON-RPC 消息
+        // POST /mcp — Receive JSON-RPC messages
         server_->Post(endpoint_, [this](const httplib::Request& req, httplib::Response& res) {
             HandlePostMessage(req, res);
         });
 
-        // GET /mcp — SSE 长连接
+        // GET /mcp — SSE long-lived connection
         server_->Get(endpoint_, [this](const httplib::Request& req, httplib::Response& res) {
             HandleGetSSE(req, res);
         });
 
-        // DELETE /mcp — 销毁会话
+        // DELETE /mcp — Destroy session
         server_->Delete(endpoint_, [this](const httplib::Request& req, httplib::Response& res) {
             HandleDeleteSession(req, res);
         });
@@ -228,13 +232,13 @@ namespace vx::transport {
     }
 
     // =========================================================================
-    // POST /mcp — 核心请求处理器
+    // POST /mcp — Core Request Handler
     // =========================================================================
 
     void StreamableTransport::HandlePostMessage(const httplib::Request& req, httplib::Response& res) {
         SetCORSHeaders(res);
 
-        // ---- 1. Content-Type 验证 ----
+        // ---- 1. Content-Type validation ----
         auto content_type = req.get_header_value("Content-Type");
         if (content_type.find("application/json") == std::string::npos) {
             res.status = 415;
@@ -242,7 +246,7 @@ namespace vx::transport {
             return;
         }
 
-        // ---- 2. Accept 头验证 ----
+        // ---- 2. Accept header validation ----
         auto accept = req.get_header_value("Accept");
         if (!accept.empty() &&
             accept.find("application/json") == std::string::npos &&
@@ -252,7 +256,7 @@ namespace vx::transport {
             return;
         }
 
-        // ---- 3. 消息体验证 ----
+        // ---- 3. Message body validation ----
         std::string message = req.body;
         if (message.empty()) {
             res.status = 400;
@@ -269,23 +273,28 @@ namespace vx::transport {
             return;
         }
 
-        // ---- 4. 会话管理 ----
+        // ---- 4. Session management ----
         bool is_initialize = parsed.contains("method") && parsed["method"] == "initialize";
 
         if (is_initialize) {
-            // 创建新会话
+            // Create a new session
             session_id_ = vx::utils::SessionBuilder::GenerateUniqueSessionID();
             session_initialized_ = true;
             client_connected_.store(true);
             LOG(INFO) << "[Streamable] Session created: " << session_id_ << std::endl;
         } else if (session_initialized_) {
-            // 非 initialize 请求必须携带有效会话 ID
+            // Non-initialize requests must carry a valid session ID
             if (!ValidateSession(req, res)) {
                 return;
             }
+        } else {
+            // Reject requests that are not 'initialize' when no session exists
+            res.status = 400;
+            res.set_content(R"({"jsonrpc":"2.0","error":{"code":-32600,"message":"Session not initialized. Send 'initialize' request first."},"id":null})", "application/json");
+            return;
         }
 
-        // ---- 5. 通知消息 (无 id) → 202 Accepted ----
+        // ---- 5. Notification messages (no id) → 202 Accepted ----
         bool is_notification = !parsed.contains("id");
         if (is_notification) {
             LOG(DEBUG) << "[Streamable] Received notification: " << message << std::endl;
@@ -302,7 +311,7 @@ namespace vx::transport {
             return;
         }
 
-        // ---- 6. 请求消息 (有 id) → 入队等待处理 ----
+        // ---- 6. Request messages (has id) → enqueue for processing ----
         std::string id_str;
         if (parsed["id"].is_number()) {
             id_str = std::to_string(parsed["id"].get<int>());
@@ -314,15 +323,15 @@ namespace vx::transport {
 
         LOG(DEBUG) << "[Streamable] Received request id=" << id_str << ": " << message << std::endl;
 
-        // ---- 7. 动态响应策略：根据 Accept 头决定 JSON 或 SSE ----
+        // ---- 7. Dynamic response strategy: choose JSON or SSE based on Accept header ----
         bool use_sse = ClientAcceptsSSE(req);
 
         auto pending = std::make_shared<PendingRequest>();
         pending->mode = use_sse ? ResponseMode::SSE : ResponseMode::JSON;
 
         if (!use_sse) {
-            // ==== JSON 模式 ====
-            // 通过 promise/future 同步等待 Server 处理结果
+            // ==== JSON mode ====
+            // Synchronously wait for the Server to produce a result via promise/future
             std::future<std::string> response_future = pending->json_promise.get_future();
 
             {
@@ -335,7 +344,7 @@ namespace vx::transport {
             }
             incoming_cv_.notify_one();
 
-            // 等待 Server 处理完成（超时 30 秒）
+            // Wait for the Server to finish processing (30-second timeout)
             auto status = response_future.wait_for(std::chrono::seconds(30));
             if (status == std::future_status::timeout) {
                 LOG(ERROR) << "[Streamable] Request timed out (id=" << id_str << ")" << std::endl;
@@ -362,8 +371,8 @@ namespace vx::transport {
             }
 
         } else {
-            // ==== SSE 流式模式 ====
-            // 设置响应头为 SSE
+            // ==== SSE streaming mode ====
+            // Set SSE response headers
             res.set_header("Content-Type", "text/event-stream");
             res.set_header("Cache-Control", "no-cache");
             res.set_header("Connection", "keep-alive");
@@ -371,31 +380,31 @@ namespace vx::transport {
                 res.set_header("MCP-Session-Id", session_id_);
             }
 
-            // 注册到待处理映射
+            // Register into the pending requests map
             pending->stream_active.store(true);
             {
                 std::lock_guard<std::mutex> lock(pending_mutex_);
                 pending_requests_.emplace(id_str, pending);
             }
-            // 将消息入队给 Server 处理
+            // Enqueue the message for Server processing
             {
                 std::lock_guard<std::mutex> lock(incoming_mutex_);
                 incoming_queue_.push(message);
             }
             incoming_cv_.notify_one();
 
-            // 使用 content_provider 持续推送 SSE 事件
+            // Use content_provider to continuously push SSE events
             res.set_content_provider("text/event-stream",
                 [this, id_str, pending_weak = std::weak_ptr<PendingRequest>(pending)](
                     size_t offset, httplib::DataSink& sink) -> bool {
 
                     auto pending = pending_weak.lock();
                     if (!pending) {
-                        return false;  // 请求已被清理
+                        return false;  // Request has already been cleaned up
                     }
 
-                    // 首次进入：将 sink 存入 PendingRequest，供 Write() 使用
-                    // 注意：DataSink 不可拷贝，存原始指针（生命周期由 httplib 管理）
+                    // First entry: store sink pointer into PendingRequest for Write() to use
+                    // Note: DataSink is non-copyable; store raw pointer (lifetime managed by httplib)
                     if (!pending->sse_sink) {
                         {
                             std::lock_guard<std::mutex> lock(pending->sink_mutex);
@@ -404,9 +413,22 @@ namespace vx::transport {
                         LOG(DEBUG) << "[Streamable] SSE sink attached for request " << id_str << std::endl;
                     }
 
-                    // 等待直到流结束或服务停止
-                    // Write() 会通过 sink 推送数据
-                    // 这里只需要保持连接存活，定期发送心跳
+                    // Define cleanup for all exit paths to prevent:
+                    //   1. Dangling pointer: nullify sse_sink after the DataSink is destroyed
+                    //   2. Memory leak: remove entry from pending_requests_
+                    auto cleanup = [&]() {
+                        {
+                            std::lock_guard<std::mutex> lock(pending->sink_mutex);
+                            pending->sse_sink = nullptr;
+                        }
+                        pending->stream_active.store(false);
+                        std::lock_guard<std::mutex> lock(pending_mutex_);
+                        pending_requests_.erase(id_str);
+                        LOG(DEBUG) << "[Streamable] SSE stream cleaned up for request " << id_str << std::endl;
+                    };
+
+                    // Keep the connection alive until the stream ends or the server stops.
+                    // Write() pushes data through the sink; this loop just maintains the connection.
                     using clock = std::chrono::steady_clock;
                     auto wait_start = clock::now();
                     const auto max_wait = std::chrono::seconds(60);
@@ -417,11 +439,14 @@ namespace vx::transport {
                             break;
                         }
 
-                        // 检查 pending 是否还在 map 中（Write 会 erase）
+                        // Check if the entry was already removed by Write()
                         {
                             std::lock_guard<std::mutex> lock(pending_mutex_);
                             if (pending_requests_.find(id_str) == pending_requests_.end()) {
-                                // 已被 Write() 处理完毕
+                                // Write() already handled completion; just clear sink pointer
+                                std::lock_guard<std::mutex> sink_lock(pending->sink_mutex);
+                                pending->sse_sink = nullptr;
+                                pending->stream_active.store(false);
                                 return false;
                             }
                         }
@@ -429,6 +454,8 @@ namespace vx::transport {
                         std::this_thread::sleep_for(std::chrono::milliseconds(50));
                     }
 
+                    // Stream ended or server stopping: full cleanup
+                    cleanup();
                     return false;
                 }
             );
@@ -436,20 +463,20 @@ namespace vx::transport {
     }
 
     // =========================================================================
-    // GET /mcp — SSE 长连接（服务器通知通道）
+    // GET /mcp — SSE Long-Lived Connection (Server Notification Channel)
     // =========================================================================
 
     void StreamableTransport::HandleGetSSE(const httplib::Request& req, httplib::Response& res) {
         SetCORSHeaders(res);
 
-        // 会话验证
+        // Session validation
         if (session_initialized_ && !ValidateSession(req, res)) {
             return;
         }
 
         LOG(INFO) << "[Streamable] GET SSE stream connected" << std::endl;
 
-        // 设置 SSE 响应头
+        // Set SSE response headers
         res.set_header("Content-Type", "text/event-stream");
         res.set_header("Cache-Control", "no-cache");
         res.set_header("Connection", "keep-alive");
@@ -459,7 +486,7 @@ namespace vx::transport {
 
         sse_stream_active_.store(true);
 
-        // 使用 content_provider 实现持续的 SSE 推送
+        // Use content_provider to implement continuous SSE push
         res.set_content_provider("text/event-stream",
             [this](size_t offset, httplib::DataSink& sink) -> bool {
                 using clock = std::chrono::steady_clock;
@@ -473,7 +500,7 @@ namespace vx::transport {
                 };
 
                 try {
-                    // 心跳保活
+                    // Keepalive ping
                     if (clock::now() - last_ping > ping_interval) {
                         const char* ping = ": keepalive\n\n";
                         if (!sink.write(ping, std::strlen(ping))) {
@@ -483,7 +510,7 @@ namespace vx::transport {
                         last_ping = clock::now();
                     }
 
-                    // 等待通知到达
+                    // Wait for a notification to arrive
                     std::unique_lock<std::mutex> lock(sse_mutex_);
                     sse_cv_.wait_for(lock, std::chrono::milliseconds(200), [this]() {
                         return !sse_notifications_.empty() || !sse_stream_active_.load();
@@ -493,7 +520,7 @@ namespace vx::transport {
                         return terminate();
                     }
 
-                    // 推送通知事件
+                    // Push the notification event
                     if (!sse_notifications_.empty()) {
                         std::string notification = std::move(sse_notifications_.front());
                         sse_notifications_.pop();
@@ -522,7 +549,7 @@ namespace vx::transport {
     }
 
     // =========================================================================
-    // DELETE /mcp — 会话销毁
+    // DELETE /mcp — Session Teardown
     // =========================================================================
 
     void StreamableTransport::HandleDeleteSession(const httplib::Request& req, httplib::Response& res) {
@@ -540,16 +567,16 @@ namespace vx::transport {
 
         LOG(INFO) << "[Streamable] Deleting session: " << session_id_ << std::endl;
 
-        // 清理会话状态
+        // Clean up session state
         session_initialized_ = false;
         client_connected_.store(false);
         sse_stream_active_.store(false);
 
-        // 唤醒所有等待线程
+        // Wake up all waiting threads
         incoming_cv_.notify_all();
         sse_cv_.notify_all();
 
-        // 清理待处理请求
+        // Clean up pending requests
         {
             std::lock_guard<std::mutex> lock(pending_mutex_);
             for (auto& [id, pending] : pending_requests_) {
@@ -566,7 +593,7 @@ namespace vx::transport {
     }
 
     // =========================================================================
-    // 会话验证
+    // Session Validation
     // =========================================================================
 
     bool StreamableTransport::ValidateSession(const httplib::Request& req, httplib::Response& res) const {
@@ -582,7 +609,7 @@ namespace vx::transport {
     }
 
     // =========================================================================
-    // 静态工具方法
+    // Static Utility Methods
     // =========================================================================
 
     bool StreamableTransport::ClientAcceptsSSE(const httplib::Request& req) {
@@ -590,12 +617,12 @@ namespace vx::transport {
         if (accept.empty()) {
             return false;
         }
-        // 客户端 Accept 头包含 text/event-stream 则使用 SSE 模式
+        // Client wants SSE if Accept header contains text/event-stream
         return accept.find("text/event-stream") != std::string::npos;
     }
 
     std::string StreamableTransport::FormatSSEEvent(const std::string& data) {
-        // 严格遵循 MCP SSE 规范：event: message + data: {json}
+        // Strictly follow MCP SSE spec: event: message + data: {json}
         return "event: message\ndata: " + data + "\n\n";
     }
 

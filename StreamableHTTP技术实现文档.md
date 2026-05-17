@@ -107,7 +107,8 @@ POST /mcp 收到请求
     │
     ├─ 4. 会话管理
     │     ├─ 是 initialize 请求 → 创建新会话，生成 MCP-Session-Id
-    │     └─ 其他请求 → 验证 MCP-Session-Id 头
+    │     ├─ 其他请求且会话已初始化 → 验证 MCP-Session-Id 头
+    │     └─ 其他请求且会话未初始化 → 400 + "Session not initialized"
     │
     ├─ 5. 判断消息类型
     │     ├─ 通知消息（无 id）→ 入队 + 返回 202 Accepted
@@ -160,10 +161,19 @@ res.set_content_provider("text/event-stream",
         // 存储 sink 指针供 Write() 使用
         pending->sse_sink = &sink;
 
+        // 定义清理函数，防止悬空指针和内存泄漏
+        auto cleanup = [&]() {
+            pending->sse_sink = nullptr;        // 防止悬空指针
+            pending->stream_active.store(false);
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            pending_requests_.erase(id_str);    // 防止内存泄漏
+        };
+
         // 保持连接直到流结束
         while (pending->stream_active.load() && running_.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
+        cleanup();  // 确保退出前清理
         return false;
     }
 );
@@ -172,6 +182,10 @@ res.set_content_provider("text/event-stream",
 std::string sse_event = "event: message\ndata: " + json_data + "\n\n";
 pending->sse_sink->write(sse_event.c_str(), sse_event.length());
 ```
+
+> **安全性说明**：content_provider 在客户端断开或超时时退出，必须在退出前执行 `cleanup()` 以：
+> 1. 将 `sse_sink` 置为 `nullptr`，防止 `Write()` 通过悬空指针调用已销毁的 `DataSink`（段错误）
+> 2. 从 `pending_requests_` 中移除条目，防止内存泄漏
 
 ### 4.2 Write() 路由逻辑
 
@@ -240,6 +254,35 @@ data: {"jsonrpc":"2.0","method":"notifications/tools/list_changed"}
 | `sse_notifications_` | `sse_mutex_` + `sse_cv_` | 生产者-消费者模式 |
 | `sse_stream_active_` | `std::atomic<bool>` | 原子操作 |
 | `client_connected_` | `std::atomic<bool>` | 原子操作 |
+| `pending->sse_sink` | `pending->sink_mutex` | 保护 SSE sink 并发访问 |
+
+### 4.6 关键安全修复
+
+#### Stop() 关机顺序
+
+`server_->stop()` 会阻塞直到所有 HTTP handler 线程退出。在 JSON 模式下，POST handler 会阻塞在 `response_future.wait_for(30s)` 上等待 `promise` 被设置值。如果先调用 `server_->stop()` 再清理 `pending_requests_`，会导致死锁（最长 30 秒）。
+
+**修复**：必须先清理 `pending_requests_`（设置 `stream_active = false` + promise 设值），再调用 `server_->stop()`。
+
+```
+Stop() 流程（修复后）:
+  1. 设置 running_ = false，通知条件变量
+  2. 清理 pending_requests_（解除所有 handler 阻塞）
+  3. server_->stop()（安全退出，无死锁）
+  4. server_thread_.join()
+```
+
+#### SSE 悬空指针与内存泄漏
+
+当客户端异常断开时，`content_provider` 退出，httplib 销毁 `DataSink` 对象。但 `PendingRequest::sse_sink` 仍指向已销毁的对象。如果随后 `Write()` 被调用，会通过悬空指针触发段错误。
+
+**修复**：在 `content_provider` 的所有退出路径上执行清理：置空 `sse_sink`、设 `stream_active = false`、从 `pending_requests_` 中移除条目。
+
+#### 未初始化请求拦截
+
+如果客户端发送的第一个请求不是 `initialize`，代码必须拒绝而非放行。
+
+**修复**：在会话管理逻辑中添加 `else` 分支，返回 `400 + -32600 "Session not initialized"`。
 
 ---
 

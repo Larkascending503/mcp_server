@@ -470,6 +470,18 @@ curl -s -D - -X POST http://localhost:8080/mcp \
 
 **预期：** `404 Not Found` + `Invalid or missing MCP-Session-Id`
 
+### 12.5 未初始化时发送非 initialize 请求
+
+```bash
+# 直接发送 tools/list 而不先 initialize（需要重启服务器确保无会话）
+curl -s -D - -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json" \
+  -d '{"jsonrpc":"2.0","id":99,"method":"tools/list"}'
+```
+
+**预期：** `400 Bad Request` + `Session not initialized. Send 'initialize' request first.`
+
 ---
 
 ## 完整测试脚本
