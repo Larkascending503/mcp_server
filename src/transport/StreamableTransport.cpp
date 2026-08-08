@@ -1,642 +1,1039 @@
-/**
- * @file StreamableTransport.cpp
- * @brief MCP Streamable HTTP Transport Implementation (2025-03-26 Spec)
- *
- * Implementation details:
- *   1. POST /mcp — Dynamic response strategy (JSON / SSE stream switching)
- *   2. GET  /mcp — SSE long-lived connection for server notifications
- *   3. DELETE /mcp — Session teardown
- *   4. CORS preflight handling
- */
-
 #include "StreamableTransport.h"
+
+#include "aixlog.hpp"
+#include "base64.hpp"
+#include "json.hpp"
+
+#include <boost/asio.hpp>
+#include <boost/asio/redirect_error.hpp>
+#include <boost/asio/use_awaitable.hpp>
+#include <boost/beast.hpp>
+
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <deque>
+#include <iomanip>
+#include <mutex>
+#include <optional>
+#include <queue>
+#include <random>
+#include <sstream>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace vx::transport {
 
-    // =========================================================================
-    // Construction / Destruction
-    // =========================================================================
+namespace asio = boost::asio;
+namespace beast = boost::beast;
+namespace http = beast::http;
+using tcp = asio::ip::tcp;
+using json = nlohmann::json;
+using namespace std::chrono_literals;
 
-    StreamableTransport::StreamableTransport(int port, std::string host, std::string endpoint)
-        : port_(port)
-        , host_(std::move(host))
-        , endpoint_(std::move(endpoint))
-        , server_(std::make_unique<httplib::Server>())
-    {
-        SetupRoutes();
+namespace {
+
+constexpr std::size_t kMaxRequestBody = 1024 * 1024;
+constexpr std::size_t kMaxQueuedResponseBytes = 1024 * 1024;
+constexpr std::size_t kMaxQueuedResponseMessages = 256;
+constexpr std::size_t kMaxPendingExchanges = 1024;
+constexpr auto kRequestTimeout = std::chrono::seconds(60);
+constexpr auto kKeepAliveInterval = std::chrono::seconds(5);
+
+bool ContainsToken(const std::string& value, const std::string& token) {
+    return value.find(token) != std::string::npos;
+}
+
+std::string JsonRpcError(int code,
+                         const std::string& message,
+                         const json& id = nullptr,
+                         const json& data = nullptr) {
+    json body = {
+        {"jsonrpc", "2.0"},
+        {"id", id},
+        {"error", {{"code", code}, {"message", message}}}
+    };
+    if (!data.is_null()) body["error"]["data"] = data;
+    return body.dump();
+}
+
+std::string MakeToken() {
+    static std::mutex random_mutex;
+    static std::random_device random;
+    std::lock_guard<std::mutex> lock(random_mutex);
+
+    std::ostringstream token;
+    token << std::hex << std::setfill('0');
+    for (int i = 0; i < 4; ++i) {
+        token << std::setw(8) << random();
     }
+    return token.str();
+}
 
-    StreamableTransport::~StreamableTransport() {
-        StreamableTransport::Stop();
+std::optional<std::string> DecodeHeaderValue(const std::string& value) {
+    constexpr std::string_view prefix = "=?base64?";
+    constexpr std::string_view suffix = "?=";
+    if (!value.starts_with(prefix)) return value;
+    if (!value.ends_with(suffix) || value.size() <= prefix.size() + suffix.size()) {
+        return std::nullopt;
     }
-
-    // =========================================================================
-    // ITransport Lifecycle
-    // =========================================================================
-
-    bool StreamableTransport::Start() {
-        if (running_.exchange(true)) {
-            LOG(WARNING) << "StreamableTransport already running" << std::endl;
-            return false;
-        }
-
-        server_thread_ = std::thread([this]() {
-            LOG(INFO) << "Streamable HTTP server starting on " << host_ << ":" << port_
-                      << " (endpoint: " << endpoint_ << ")" << std::endl;
-            if (!server_->listen(host_.c_str(), port_)) {
-                LOG(ERROR) << "Streamable HTTP server failed to start on "
-                           << host_ << ":" << port_ << std::endl;
-                running_.store(false);
-            }
-        });
-
-        // Wait for server to start
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        return running_.load();
+    try {
+        auto encoded = std::string_view(value).substr(
+            prefix.size(), value.size() - prefix.size() - suffix.size());
+        return base64::from_base64(encoded);
+    } catch (...) {
+        return std::nullopt;
     }
+}
 
-    void StreamableTransport::Stop() {
-        if (!running_.exchange(false)) {
-            return;
-        }
+std::string SseEvent(const std::string& data) {
+    return "event: message\r\ndata: " + data + "\r\n\r\n";
+}
 
-        LOG(INFO) << "Stopping Streamable HTTP server..." << std::endl;
+} // namespace
 
-        // Notify all waiting threads
-        client_connected_.store(false);
-        sse_stream_active_.store(false);
-        incoming_cv_.notify_all();
-        sse_cv_.notify_all();
+class StreamableTransport::Impl {
+public:
+    class ResponseQueue : public std::enable_shared_from_this<ResponseQueue> {
+    public:
+        ResponseQueue(asio::any_io_executor executor,
+                      std::string exchange_id,
+                      std::string session_id = {},
+                      bool modern = false)
+            : executor_(std::move(executor)),
+              wake_(executor_),
+              exchange_id_(std::move(exchange_id)),
+              session_id_(std::move(session_id)),
+              modern_(modern),
+              cancelled_(std::make_shared<std::atomic_bool>(false)) {}
 
-        // Fix: Clean up pending_requests_ BEFORE calling server_->stop().
-        // server_->stop() blocks until all HTTP handler threads exit. If a
-        // handler is blocked on response_future.wait_for(30s), it must be
-        // unblocked first; otherwise we deadlock for up to 30 seconds.
-        {
-            std::lock_guard<std::mutex> lock(pending_mutex_);
-            for (auto& [id, pending] : pending_requests_) {
-                pending->stream_active.store(false);
-                try {
-                    pending->json_promise.set_value("");
-                } catch (const std::exception& e) {
-                    LOG(ERROR) << "Failed to resolve pending request during shutdown: "
-                               << id << " (" << e.what() << ")" << std::endl;
-                }
-            }
-            pending_requests_.clear();
-        }
-
-        // Stop HTTP server (all handler futures have been resolved above)
-        if (server_) {
-            server_->stop();
-        }
-
-        // Wait for the listener thread to exit
-        if (server_thread_.joinable()) {
-            server_thread_.join();
-        }
-
-        LOG(INFO) << "Streamable HTTP server stopped" << std::endl;
-    }
-
-    // =========================================================================
-    // ITransport Read / Write Interface
-    // =========================================================================
-
-    std::pair<size_t, std::string> StreamableTransport::Read() {
-        std::unique_lock<std::mutex> lock(incoming_mutex_);
-        incoming_cv_.wait(lock, [this]() {
-            return !incoming_queue_.empty() || !running_.load();
-        });
-
-        if (!running_.load() && incoming_queue_.empty()) {
-            return {0, ""};
-        }
-
-        if (!incoming_queue_.empty()) {
-            std::string message = std::move(incoming_queue_.front());
-            incoming_queue_.pop();
-            return {message.length(), std::move(message)};
-        }
-
-        return {0, ""};
-    }
-
-    std::future<std::pair<size_t, std::string>> StreamableTransport::ReadAsync() {
-        return std::async(std::launch::async, [this]() -> std::pair<size_t, std::string> {
-            return Read();
-        });
-    }
-
-    void StreamableTransport::Write(const std::string& json_data) {
-        if (!client_connected_.load()) {
-            return;
-        }
-
-        try {
-            auto parsed = nlohmann::json::parse(json_data);
-
-            // --- Routing: is this a response to a pending request or a server notification? ---
-
-            // Condition: has "id" AND has "result" or "error" → response to a POST request
-            if (parsed.contains("id") && (parsed.contains("result") || parsed.contains("error"))) {
-                std::string id_str;
-                if (parsed["id"].is_number()) {
-                    id_str = std::to_string(parsed["id"].get<int>());
-                } else if (parsed["id"].is_string()) {
-                    id_str = parsed["id"].get<std::string>();
-                } else {
-                    id_str = "null";
-                }
-
-                std::lock_guard<std::mutex> lock(pending_mutex_);
-                auto it = pending_requests_.find(id_str);
-                if (it != pending_requests_.end()) {
-                    auto& pending = it->second;
-
-                    if (pending->mode == ResponseMode::JSON) {
-                        // ---- JSON mode: resolve the promise to return the response ----
-                        LOG(DEBUG) << "[Streamable] Resolving JSON response for request " << id_str << std::endl;
-                        pending->json_promise.set_value(json_data);
-                    } else {
-                        // ---- SSE mode: push the SSE event via DataSink ----
-                        std::lock_guard<std::mutex> sink_lock(pending->sink_mutex);
-                        if (pending->stream_active.load() && pending->sse_sink != nullptr) {
-                            std::string sse_event = FormatSSEEvent(json_data);
-                            LOG(DEBUG) << "[Streamable] Streaming SSE response for request "
-                                       << id_str << ": " << sse_event << std::endl;
-                            if (!pending->sse_sink->write(sse_event.c_str(), sse_event.length())) {
-                                LOG(ERROR) << "[Streamable] Failed to write SSE event for request "
-                                           << id_str << std::endl;
-                                pending->stream_active.store(false);
-                            }
-                        }
-                    }
-                    pending_requests_.erase(it);
+        void Push(TransportWrite message) {
+            asio::post(executor_, [self = shared_from_this(), message = std::move(message)]() mutable {
+                if (self->closed_) return;
+                if (self->messages_.size() >= kMaxQueuedResponseMessages ||
+                    self->queued_bytes_ + message.data.size() > kMaxQueuedResponseBytes) {
+                    self->cancelled_->store(true);
+                    self->closed_ = true;
+                    self->wake_.cancel();
+                    LOG(WARNING) << "[Streamable] closing slow response stream "
+                                 << self->exchange_id_ << " due to backpressure" << std::endl;
                     return;
                 }
-            }
-
-            // --- Not a request response → treat as server notification, push to GET SSE stream ---
-            if (sse_stream_active_.load()) {
-                std::lock_guard<std::mutex> lock(sse_mutex_);
-                sse_notifications_.push(json_data);
-                sse_cv_.notify_one();
-                LOG(DEBUG) << "[Streamable] Queued notification for GET SSE stream" << std::endl;
-            }
-
-        } catch (const nlohmann::json::exception& e) {
-            LOG(ERROR) << "[Streamable] JSON parse error in Write(): " << e.what() << std::endl;
-        } catch (const std::exception& e) {
-            LOG(ERROR) << "[Streamable] Error in Write(): " << e.what() << std::endl;
-        }
-    }
-
-    std::future<void> StreamableTransport::WriteAsync(const std::string& json_data) {
-        return std::async(std::launch::async, [this, json_data]() {
-            Write(json_data);
-        });
-    }
-
-    // =========================================================================
-    // Route Registration
-    // =========================================================================
-
-    void StreamableTransport::SetupRoutes() {
-        // CORS preflight
-        server_->Options("/.*", [](const httplib::Request& req, httplib::Response& res) {
-            HandleOptionsRequest(req, res);
-        });
-
-        // Health check
-        server_->Get("/health", [](const httplib::Request& req, httplib::Response& res) {
-            res.set_content(R"({"status":"ok","transport":"streamable-http"})", "application/json");
-        });
-
-        // POST /mcp — Receive JSON-RPC messages
-        server_->Post(endpoint_, [this](const httplib::Request& req, httplib::Response& res) {
-            HandlePostMessage(req, res);
-        });
-
-        // GET /mcp — SSE long-lived connection
-        server_->Get(endpoint_, [this](const httplib::Request& req, httplib::Response& res) {
-            HandleGetSSE(req, res);
-        });
-
-        // DELETE /mcp — Destroy session
-        server_->Delete(endpoint_, [this](const httplib::Request& req, httplib::Response& res) {
-            HandleDeleteSession(req, res);
-        });
-
-        LOG(INFO) << "[Streamable] Routes registered: POST/GET/DELETE " << endpoint_ << std::endl;
-    }
-
-    // =========================================================================
-    // POST /mcp — Core Request Handler
-    // =========================================================================
-
-    void StreamableTransport::HandlePostMessage(const httplib::Request& req, httplib::Response& res) {
-        SetCORSHeaders(res);
-
-        // ---- 1. Content-Type validation ----
-        auto content_type = req.get_header_value("Content-Type");
-        if (content_type.find("application/json") == std::string::npos) {
-            res.status = 415;
-            res.set_content(R"({"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Content-Type. Expected application/json"},"id":null})", "application/json");
-            return;
+                self->queued_bytes_ += message.data.size();
+                self->messages_.push_back(std::move(message));
+                self->wake_.cancel();
+            });
         }
 
-        // ---- 2. Accept header validation ----
-        auto accept = req.get_header_value("Accept");
-        if (!accept.empty() &&
-            accept.find("application/json") == std::string::npos &&
-            accept.find("text/event-stream") == std::string::npos) {
-            res.status = 406;
-            res.set_content(R"({"jsonrpc":"2.0","error":{"code":-32600,"message":"Not Acceptable. Expected application/json or text/event-stream"},"id":null})", "application/json");
-            return;
+        void Close() {
+            cancelled_->store(true);
+            asio::post(executor_, [self = shared_from_this()]() {
+                self->closed_ = true;
+                self->wake_.cancel();
+            });
         }
 
-        // ---- 3. Message body validation ----
-        std::string message = req.body;
-        if (message.empty()) {
-            res.status = 400;
-            res.set_content(R"({"jsonrpc":"2.0","error":{"code":-32600,"message":"Empty request body"},"id":null})", "application/json");
-            return;
-        }
-
-        nlohmann::json parsed;
-        try {
-            parsed = nlohmann::json::parse(message);
-        } catch (const nlohmann::json::parse_error& e) {
-            res.status = 400;
-            res.set_content(R"({"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error"},"id":null})", "application/json");
-            return;
-        }
-
-        // ---- 4. Session management ----
-        bool is_initialize = parsed.contains("method") && parsed["method"] == "initialize";
-
-        if (is_initialize) {
-            // Create a new session
-            session_id_ = vx::utils::SessionBuilder::GenerateUniqueSessionID();
-            session_initialized_ = true;
-            client_connected_.store(true);
-            LOG(INFO) << "[Streamable] Session created: " << session_id_ << std::endl;
-        } else if (session_initialized_) {
-            // Non-initialize requests must carry a valid session ID
-            if (!ValidateSession(req, res)) {
-                return;
-            }
-        } else {
-            // Reject requests that are not 'initialize' when no session exists
-            res.status = 400;
-            res.set_content(R"({"jsonrpc":"2.0","error":{"code":-32600,"message":"Session not initialized. Send 'initialize' request first."},"id":null})", "application/json");
-            return;
-        }
-
-        // ---- 5. Notification messages (no id) → 202 Accepted ----
-        bool is_notification = !parsed.contains("id");
-        if (is_notification) {
-            LOG(DEBUG) << "[Streamable] Received notification: " << message << std::endl;
-            {
-                std::lock_guard<std::mutex> lock(incoming_mutex_);
-                incoming_queue_.push(message);
-            }
-            incoming_cv_.notify_one();
-
-            res.status = 202;
-            if (session_initialized_) {
-                res.set_header("MCP-Session-Id", session_id_);
-            }
-            return;
-        }
-
-        // ---- 6. Request messages (has id) → enqueue for processing ----
-        std::string id_str;
-        if (parsed["id"].is_number()) {
-            id_str = std::to_string(parsed["id"].get<int>());
-        } else if (parsed["id"].is_string()) {
-            id_str = parsed["id"].get<std::string>();
-        } else {
-            id_str = "null";
-        }
-
-        LOG(DEBUG) << "[Streamable] Received request id=" << id_str << ": " << message << std::endl;
-
-        // ---- 7. Dynamic response strategy: choose JSON or SSE based on Accept header ----
-        bool use_sse = ClientAcceptsSSE(req);
-
-        auto pending = std::make_shared<PendingRequest>();
-        pending->mode = use_sse ? ResponseMode::SSE : ResponseMode::JSON;
-
-        if (!use_sse) {
-            // ==== JSON mode ====
-            // Synchronously wait for the Server to produce a result via promise/future
-            std::future<std::string> response_future = pending->json_promise.get_future();
-
-            {
-                std::lock_guard<std::mutex> lock(pending_mutex_);
-                pending_requests_.emplace(id_str, pending);
-            }
-            {
-                std::lock_guard<std::mutex> lock(incoming_mutex_);
-                incoming_queue_.push(message);
-            }
-            incoming_cv_.notify_one();
-
-            // Wait for the Server to finish processing (30-second timeout)
-            auto status = response_future.wait_for(std::chrono::seconds(30));
-            if (status == std::future_status::timeout) {
-                LOG(ERROR) << "[Streamable] Request timed out (id=" << id_str << ")" << std::endl;
-                {
-                    std::lock_guard<std::mutex> lock(pending_mutex_);
-                    pending_requests_.erase(id_str);
+        asio::awaitable<std::optional<TransportWrite>> PopFor(std::chrono::steady_clock::duration timeout) {
+            for (;;) {
+                if (!messages_.empty()) {
+                    auto message = std::move(messages_.front());
+                    queued_bytes_ -= message.data.size();
+                    messages_.pop_front();
+                    co_return message;
                 }
-                res.status = 504;
-                res.set_content(R"({"jsonrpc":"2.0","error":{"code":-32603,"message":"Request timed out"},"id":null})", "application/json");
-                return;
+                if (closed_) co_return std::nullopt;
+
+                wake_.expires_after(timeout);
+                boost::system::error_code ec;
+                co_await wake_.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+                if (!ec && messages_.empty()) co_return std::nullopt;
             }
-
-            std::string response_data = response_future.get();
-            if (response_data.empty()) {
-                res.status = 500;
-                res.set_content(R"({"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal server error"},"id":null})", "application/json");
-                return;
-            }
-
-            res.status = 200;
-            res.set_content(response_data, "application/json");
-            if (session_initialized_) {
-                res.set_header("MCP-Session-Id", session_id_);
-            }
-
-        } else {
-            // ==== SSE streaming mode ====
-            // Set SSE response headers
-            res.set_header("Content-Type", "text/event-stream");
-            res.set_header("Cache-Control", "no-cache");
-            res.set_header("Connection", "keep-alive");
-            if (session_initialized_) {
-                res.set_header("MCP-Session-Id", session_id_);
-            }
-
-            // Register into the pending requests map
-            pending->stream_active.store(true);
-            {
-                std::lock_guard<std::mutex> lock(pending_mutex_);
-                pending_requests_.emplace(id_str, pending);
-            }
-            // Enqueue the message for Server processing
-            {
-                std::lock_guard<std::mutex> lock(incoming_mutex_);
-                incoming_queue_.push(message);
-            }
-            incoming_cv_.notify_one();
-
-            // Use content_provider to continuously push SSE events
-            res.set_content_provider("text/event-stream",
-                [this, id_str, pending_weak = std::weak_ptr<PendingRequest>(pending)](
-                    size_t offset, httplib::DataSink& sink) -> bool {
-
-                    auto pending = pending_weak.lock();
-                    if (!pending) {
-                        return false;  // Request has already been cleaned up
-                    }
-
-                    // First entry: store sink pointer into PendingRequest for Write() to use
-                    // Note: DataSink is non-copyable; store raw pointer (lifetime managed by httplib)
-                    if (!pending->sse_sink) {
-                        {
-                            std::lock_guard<std::mutex> lock(pending->sink_mutex);
-                            pending->sse_sink = &sink;
-                        }
-                        LOG(DEBUG) << "[Streamable] SSE sink attached for request " << id_str << std::endl;
-                    }
-
-                    // Define cleanup for all exit paths to prevent:
-                    //   1. Dangling pointer: nullify sse_sink after the DataSink is destroyed
-                    //   2. Memory leak: remove entry from pending_requests_
-                    auto cleanup = [&]() {
-                        {
-                            std::lock_guard<std::mutex> lock(pending->sink_mutex);
-                            pending->sse_sink = nullptr;
-                        }
-                        pending->stream_active.store(false);
-                        std::lock_guard<std::mutex> lock(pending_mutex_);
-                        pending_requests_.erase(id_str);
-                        LOG(DEBUG) << "[Streamable] SSE stream cleaned up for request " << id_str << std::endl;
-                    };
-
-                    // Keep the connection alive until the stream ends or the server stops.
-                    // Write() pushes data through the sink; this loop just maintains the connection.
-                    using clock = std::chrono::steady_clock;
-                    auto wait_start = clock::now();
-                    const auto max_wait = std::chrono::seconds(60);
-
-                    while (pending->stream_active.load() && running_.load()) {
-                        if (clock::now() - wait_start > max_wait) {
-                            LOG(WARNING) << "[Streamable] SSE stream timeout for request " << id_str << std::endl;
-                            break;
-                        }
-
-                        // Check if the entry was already removed by Write()
-                        {
-                            std::lock_guard<std::mutex> lock(pending_mutex_);
-                            if (pending_requests_.find(id_str) == pending_requests_.end()) {
-                                // Write() already handled completion; just clear sink pointer
-                                std::lock_guard<std::mutex> sink_lock(pending->sink_mutex);
-                                pending->sse_sink = nullptr;
-                                pending->stream_active.store(false);
-                                return false;
-                            }
-                        }
-
-                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                    }
-
-                    // Stream ended or server stopping: full cleanup
-                    cleanup();
-                    return false;
-                }
-            );
         }
+
+        bool Closed() const { return closed_; }
+        const std::string& ExchangeId() const { return exchange_id_; }
+        const std::string& SessionId() const { return session_id_; }
+        bool Modern() const { return modern_; }
+        std::shared_ptr<std::atomic_bool> CancellationFlag() const { return cancelled_; }
+
+    private:
+        asio::any_io_executor executor_;
+        asio::steady_timer wake_;
+        std::deque<TransportWrite> messages_;
+        std::string exchange_id_;
+        std::string session_id_;
+        bool modern_{false};
+        std::shared_ptr<std::atomic_bool> cancelled_;
+        std::size_t queued_bytes_{0};
+        bool closed_{false};
+    };
+
+    struct RouteResult {
+        std::optional<http::response<http::string_body>> immediate{};
+        std::shared_ptr<ResponseQueue> channel{};
+        bool sse{false};
+        bool long_lived{false};
+    };
+
+    struct LegacySession {
+        std::string id;
+        std::weak_ptr<ResponseQueue> notification_stream;
+    };
+
+    struct SubscriptionFilter {
+        bool tools_list_changed{false};
+        bool prompts_list_changed{false};
+        bool resources_list_changed{false};
+        std::vector<std::string> resource_subscriptions;
+        json request_id;
+
+        json AcknowledgedNotifications() const {
+            json notifications = json::object();
+            if (tools_list_changed) notifications["toolsListChanged"] = true;
+            if (prompts_list_changed) notifications["promptsListChanged"] = true;
+            if (resources_list_changed) notifications["resourcesListChanged"] = true;
+            if (!resource_subscriptions.empty()) {
+                notifications["resourceSubscriptions"] = resource_subscriptions;
+            }
+            return notifications;
+        }
+    };
+
+    struct Subscription {
+        std::weak_ptr<ResponseQueue> channel;
+        SubscriptionFilter filter;
+    };
+
+    class HttpSession : public std::enable_shared_from_this<HttpSession> {
+    public:
+        HttpSession(tcp::socket socket, Impl& owner)
+            : stream_(std::move(socket)), owner_(owner) {}
+
+        void Start() {
+            asio::co_spawn(
+                stream_.get_executor(),
+                [self = shared_from_this()]() -> asio::awaitable<void> {
+                    co_await self->Run();
+                },
+                [](std::exception_ptr error) {
+                    if (!error) return;
+                    try {
+                        std::rethrow_exception(error);
+                    } catch (const std::exception& e) {
+                        LOG(ERROR) << "[Streamable] connection coroutine failed: "
+                                   << e.what() << std::endl;
+                    }
+                });
+        }
+
+    private:
+        asio::awaitable<void> Run() {
+            boost::system::error_code ec;
+            for (;;) {
+                stream_.expires_after(30s);
+                http::request_parser<http::string_body> parser;
+                parser.body_limit(kMaxRequestBody);
+                co_await http::async_read(
+                    stream_, buffer_, parser,
+                    asio::redirect_error(asio::use_awaitable, ec));
+                if (ec == http::error::end_of_stream || ec == asio::error::eof) break;
+                if (ec) {
+                    LOG(DEBUG) << "[Streamable] HTTP read ended: " << ec.message() << std::endl;
+                    break;
+                }
+
+                auto request = parser.release();
+                auto route = owner_.Route(request, stream_.get_executor());
+                if (route.immediate) {
+                    const bool keep_alive = route.immediate->keep_alive();
+                    co_await http::async_write(
+                        stream_, *route.immediate,
+                        asio::redirect_error(asio::use_awaitable, ec));
+                    if (ec || !keep_alive) break;
+                    continue;
+                }
+
+                if (!route.channel) break;
+                active_channel_ = route.channel;
+                if (route.sse) {
+                    co_await WriteSse(request, route.channel, route.long_lived, ec);
+                } else {
+                    co_await WriteJson(request, route.channel, ec);
+                }
+
+                owner_.Unregister(route.channel->ExchangeId());
+                route.channel->Close();
+                active_channel_.reset();
+                if (ec || route.sse || !request.keep_alive()) break;
+            }
+
+            if (active_channel_) {
+                owner_.Unregister(active_channel_->ExchangeId());
+                active_channel_->Close();
+            }
+            stream_.socket().shutdown(tcp::socket::shutdown_send, ec);
+            co_return;
+        }
+
+        asio::awaitable<void> WriteJson(
+            const http::request<http::string_body>& request,
+            const std::shared_ptr<ResponseQueue>& channel,
+            boost::system::error_code& ec) {
+            auto message = co_await channel->PopFor(kRequestTimeout);
+            while (message && !message->final) {
+                // A non-streaming POST cannot carry intermediate events. Legacy
+                // clients receive them through their GET stream instead.
+                owner_.Broadcast(message->data);
+                message = co_await channel->PopFor(kRequestTimeout);
+            }
+            if (!message) {
+                auto response = owner_.MakeResponse(
+                    request, http::status::gateway_timeout,
+                    JsonRpcError(-32603, "Request timed out"));
+                co_await http::async_write(
+                    stream_, response,
+                    asio::redirect_error(asio::use_awaitable, ec));
+                co_return;
+            }
+
+            auto response = owner_.MakeResponse(
+                request, owner_.HttpStatusForResponse(message->data, channel->Modern()),
+                owner_.NormalizeResponse(message->data, channel->Modern()));
+            if (!channel->SessionId().empty()) {
+                response.set("Mcp-Session-Id", channel->SessionId());
+            }
+            co_await http::async_write(
+                stream_, response,
+                asio::redirect_error(asio::use_awaitable, ec));
+        }
+
+        asio::awaitable<void> WriteSse(
+            const http::request<http::string_body>& request,
+            const std::shared_ptr<ResponseQueue>& channel,
+            bool long_lived,
+            boost::system::error_code& ec) {
+            stream_.expires_never();
+
+            http::response<http::empty_body> response{http::status::ok, request.version()};
+            response.set(http::field::server, "mcp-server");
+            response.set(http::field::content_type, "text/event-stream; charset=utf-8");
+            response.set(http::field::cache_control, "no-cache, no-transform");
+            response.set(http::field::connection, "keep-alive");
+            response.set("X-Accel-Buffering", "no");
+            if (!channel->SessionId().empty()) {
+                response.set("Mcp-Session-Id", channel->SessionId());
+            }
+            owner_.AddCorsHeaders(request, response);
+            if (!request["MCP-Protocol-Version"].empty()) {
+                response.set("MCP-Protocol-Version", request["MCP-Protocol-Version"]);
+            }
+            response.chunked(true);
+            response.keep_alive(true);
+
+            http::response_serializer<http::empty_body> serializer{response};
+            co_await http::async_write_header(
+                stream_, serializer,
+                asio::redirect_error(asio::use_awaitable, ec));
+            if (ec) co_return;
+
+            const auto deadline = std::chrono::steady_clock::now() + kRequestTimeout;
+            for (;;) {
+                if (!long_lived && std::chrono::steady_clock::now() >= deadline) break;
+                auto message = co_await channel->PopFor(kKeepAliveInterval);
+                if (!message) {
+                    if (channel->Closed()) break;
+                    if (!long_lived && std::chrono::steady_clock::now() >= deadline) {
+                        break;
+                    }
+                    const std::string keep_alive = ": keepalive\r\n\r\n";
+                    auto chunk = http::make_chunk(asio::buffer(keep_alive));
+                    co_await asio::async_write(
+                        stream_.socket(), chunk,
+                        asio::redirect_error(asio::use_awaitable, ec));
+                    if (ec) break;
+                    continue;
+                }
+
+                const std::string payload = message->final
+                    ? owner_.NormalizeResponse(message->data, channel->Modern())
+                    : message->data;
+                const std::string event = SseEvent(payload);
+                auto chunk = http::make_chunk(asio::buffer(event));
+                co_await asio::async_write(
+                    stream_.socket(), chunk,
+                    asio::redirect_error(asio::use_awaitable, ec));
+                if (ec || message->final) break;
+            }
+
+            if (!ec) {
+                auto last = http::make_chunk_last();
+                co_await asio::async_write(
+                    stream_.socket(), last,
+                    asio::redirect_error(asio::use_awaitable, ec));
+            }
+        }
+
+        beast::tcp_stream stream_;
+        beast::flat_buffer buffer_;
+        Impl& owner_;
+        std::shared_ptr<ResponseQueue> active_channel_;
+    };
+
+    Impl(int port, std::string host, std::string endpoint)
+        : port_(port), host_(std::move(host)), endpoint_(std::move(endpoint)), ioc_(1) {}
+
+    ~Impl() { Stop(); }
+
+    bool Start() {
+        if (running_.exchange(true)) return false;
+
+        boost::system::error_code ec;
+        const auto address = asio::ip::make_address(host_, ec);
+        if (ec) {
+            LOG(ERROR) << "[Streamable] invalid bind address: " << host_ << std::endl;
+            running_.store(false);
+            return false;
+        }
+
+        acceptor_ = std::make_unique<tcp::acceptor>(ioc_);
+        const tcp::endpoint endpoint(address, static_cast<unsigned short>(port_));
+        acceptor_->open(endpoint.protocol(), ec);
+        if (!ec) acceptor_->set_option(asio::socket_base::reuse_address(true), ec);
+        if (!ec) acceptor_->bind(endpoint, ec);
+        if (!ec) acceptor_->listen(asio::socket_base::max_listen_connections, ec);
+        if (ec) {
+            LOG(ERROR) << "[Streamable] failed to listen on " << host_ << ':' << port_
+                       << ": " << ec.message() << std::endl;
+            running_.store(false);
+            acceptor_.reset();
+            return false;
+        }
+
+        DoAccept();
+        const auto count = std::max(2u, std::thread::hardware_concurrency());
+        io_threads_.reserve(count);
+        for (unsigned i = 0; i < count; ++i) {
+            io_threads_.emplace_back([this]() { ioc_.run(); });
+        }
+
+        LOG(INFO) << "[Streamable] listening on " << host_ << ':' << port_
+                  << " endpoint=" << endpoint_ << " workers=" << count << std::endl;
+        return true;
     }
 
-    // =========================================================================
-    // GET /mcp — SSE Long-Lived Connection (Server Notification Channel)
-    // =========================================================================
+    void Stop() {
+        if (!running_.exchange(false)) return;
 
-    void StreamableTransport::HandleGetSSE(const httplib::Request& req, httplib::Response& res) {
-        SetCORSHeaders(res);
-
-        // Session validation
-        if (session_initialized_ && !ValidateSession(req, res)) {
-            return;
-        }
-
-        LOG(INFO) << "[Streamable] GET SSE stream connected" << std::endl;
-
-        // Set SSE response headers
-        res.set_header("Content-Type", "text/event-stream");
-        res.set_header("Cache-Control", "no-cache");
-        res.set_header("Connection", "keep-alive");
-        if (session_initialized_) {
-            res.set_header("MCP-Session-Id", session_id_);
-        }
-
-        sse_stream_active_.store(true);
-
-        // Use content_provider to implement continuous SSE push
-        res.set_content_provider("text/event-stream",
-            [this](size_t offset, httplib::DataSink& sink) -> bool {
-                using clock = std::chrono::steady_clock;
-                static thread_local auto last_ping = clock::now();
-                const auto ping_interval = std::chrono::seconds(5);
-
-                auto terminate = [this]() -> bool {
-                    sse_stream_active_.store(false);
-                    sse_cv_.notify_all();
-                    return false;
-                };
-
-                try {
-                    // Keepalive ping
-                    if (clock::now() - last_ping > ping_interval) {
-                        const char* ping = ": keepalive\n\n";
-                        if (!sink.write(ping, std::strlen(ping))) {
-                            LOG(ERROR) << "[Streamable] GET SSE keepalive write failed" << std::endl;
-                            return terminate();
-                        }
-                        last_ping = clock::now();
-                    }
-
-                    // Wait for a notification to arrive
-                    std::unique_lock<std::mutex> lock(sse_mutex_);
-                    sse_cv_.wait_for(lock, std::chrono::milliseconds(200), [this]() {
-                        return !sse_notifications_.empty() || !sse_stream_active_.load();
-                    });
-
-                    if (!sse_stream_active_.load()) {
-                        return terminate();
-                    }
-
-                    // Push the notification event
-                    if (!sse_notifications_.empty()) {
-                        std::string notification = std::move(sse_notifications_.front());
-                        sse_notifications_.pop();
-                        lock.unlock();
-
-                        std::string sse_event = FormatSSEEvent(notification);
-                        LOG(DEBUG) << "[Streamable] GET SSE push: " << sse_event << std::endl;
-
-                        if (!sink.write(sse_event.c_str(), sse_event.length())) {
-                            LOG(ERROR) << "[Streamable] GET SSE write failed" << std::endl;
-                            return terminate();
-                        }
-                    }
-
-                    return true;
-
-                } catch (const std::exception& e) {
-                    LOG(ERROR) << "[Streamable] GET SSE error: " << e.what() << std::endl;
-                    return terminate();
-                } catch (...) {
-                    LOG(ERROR) << "[Streamable] GET SSE unknown error" << std::endl;
-                    return terminate();
-                }
-            }
-        );
-    }
-
-    // =========================================================================
-    // DELETE /mcp — Session Teardown
-    // =========================================================================
-
-    void StreamableTransport::HandleDeleteSession(const httplib::Request& req, httplib::Response& res) {
-        SetCORSHeaders(res);
-
-        if (!session_initialized_) {
-            res.status = 404;
-            res.set_content(R"({"jsonrpc":"2.0","error":{"code":-32600,"message":"No active session"},"id":null})", "application/json");
-            return;
-        }
-
-        if (!ValidateSession(req, res)) {
-            return;
-        }
-
-        LOG(INFO) << "[Streamable] Deleting session: " << session_id_ << std::endl;
-
-        // Clean up session state
-        session_initialized_ = false;
-        client_connected_.store(false);
-        sse_stream_active_.store(false);
-
-        // Wake up all waiting threads
-        incoming_cv_.notify_all();
-        sse_cv_.notify_all();
-
-        // Clean up pending requests
         {
             std::lock_guard<std::mutex> lock(pending_mutex_);
-            for (auto& [id, pending] : pending_requests_) {
-                pending->stream_active.store(false);
-                try {
-                    pending->json_promise.set_value("");
-                } catch (...) {}
+            for (auto& [_, weak] : pending_) {
+                if (auto channel = weak.lock()) channel->Close();
             }
-            pending_requests_.clear();
+            pending_.clear();
+            for (auto& [_, subscription] : subscriptions_) {
+                if (auto channel = subscription.channel.lock()) channel->Close();
+            }
+            subscriptions_.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            for (auto& [_, session] : sessions_) {
+                if (auto channel = session.notification_stream.lock()) channel->Close();
+            }
+            sessions_.clear();
         }
 
-        res.status = 200;
-        res.set_content(R"({"status":"session terminated"})", "application/json");
+        boost::system::error_code ec;
+        if (acceptor_) acceptor_->close(ec);
+        ioc_.stop();
+        for (auto& thread : io_threads_) {
+            if (thread.joinable()) thread.join();
+        }
+        io_threads_.clear();
+        incoming_cv_.notify_all();
+        LOG(INFO) << "[Streamable] stopped" << std::endl;
     }
 
-    // =========================================================================
-    // Session Validation
-    // =========================================================================
+    bool IsRunning() const { return running_.load(); }
 
-    bool StreamableTransport::ValidateSession(const httplib::Request& req, httplib::Response& res) const {
-        auto client_session = req.get_header_value("MCP-Session-Id");
-        if (client_session.empty() || client_session != session_id_) {
-            LOG(WARNING) << "[Streamable] Invalid session ID: '" << client_session
-                         << "' (expected: '" << session_id_ << "')" << std::endl;
-            res.status = 404;
-            res.set_content(R"({"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid or missing MCP-Session-Id"},"id":null})", "application/json");
-            return false;
+    TransportMessage ReadMessage() {
+        std::unique_lock<std::mutex> lock(incoming_mutex_);
+        incoming_cv_.wait(lock, [this]() {
+            return !incoming_.empty() || !running_.load();
+        });
+        if (incoming_.empty()) return {};
+        auto message = std::move(incoming_.front());
+        incoming_.pop();
+        return message;
+    }
+
+    void WriteMessage(TransportWrite message) {
+        if (message.exchange_id.empty()) {
+            Broadcast(message.data);
+            return;
+        }
+
+        std::shared_ptr<ResponseQueue> channel;
+        {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            const auto it = pending_.find(message.exchange_id);
+            if (it != pending_.end()) channel = it->second.lock();
+        }
+        if (channel) channel->Push(std::move(message));
+    }
+
+private:
+    void DoAccept() {
+        acceptor_->async_accept(
+            asio::make_strand(ioc_),
+            [this](boost::system::error_code ec, tcp::socket socket) {
+                if (!ec) std::make_shared<HttpSession>(std::move(socket), *this)->Start();
+                if (running_.load()) DoAccept();
+            });
+    }
+
+    std::string RequestPath(const http::request<http::string_body>& request) const {
+        const auto target = request.target();
+        const auto query = target.find('?');
+        return std::string(target.substr(0, query));
+    }
+
+    bool IsOriginAllowed(const http::request<http::string_body>& request) const {
+        const auto it = request.find(http::field::origin);
+        if (it == request.end()) return true;
+        const std::string origin(it->value());
+        const auto scheme = origin.find("://");
+        if (scheme == std::string::npos) return false;
+        auto authority = origin.substr(scheme + 3);
+        if (const auto slash = authority.find('/'); slash != std::string::npos) {
+            authority.resize(slash);
+        }
+        if (authority.find('@') != std::string::npos) return false;
+
+        std::string host = authority;
+        if (host.starts_with('[')) {
+            const auto closing = host.find(']');
+            if (closing == std::string::npos) return false;
+            host = host.substr(1, closing - 1);
+        } else if (const auto colon = host.find(':'); colon != std::string::npos) {
+            host.resize(colon);
+        }
+
+        return host == "localhost" || host == "127.0.0.1" || host == "::1" ||
+               (host_ != "0.0.0.0" && host_ != "::" && host == host_);
+    }
+
+    template <class Body>
+    void AddCorsHeaders(const http::request<http::string_body>& request,
+                        http::response<Body>& response) const {
+        const auto origin = request.find(http::field::origin);
+        if (origin != request.end() && IsOriginAllowed(request)) {
+            response.set(http::field::access_control_allow_origin, origin->value());
+            response.set(http::field::vary, "Origin");
+        }
+        response.set(http::field::access_control_allow_methods, "POST, GET, DELETE, OPTIONS");
+        response.set(http::field::access_control_allow_headers,
+                     "Content-Type, Authorization, MCP-Protocol-Version, "
+                     "Mcp-Session-Id, Mcp-Method, Mcp-Name");
+        response.set(http::field::access_control_expose_headers,
+                     "MCP-Protocol-Version, Mcp-Session-Id");
+    }
+
+    http::response<http::string_body> MakeResponse(
+        const http::request<http::string_body>& request,
+        http::status status,
+        std::string body,
+        std::string content_type = "application/json; charset=utf-8") const {
+        http::response<http::string_body> response{status, request.version()};
+        response.set(http::field::server, "mcp-server");
+        response.set(http::field::content_type, std::move(content_type));
+        AddCorsHeaders(request, response);
+        if (!request["MCP-Protocol-Version"].empty()) {
+            response.set("MCP-Protocol-Version", request["MCP-Protocol-Version"]);
+        }
+        response.keep_alive(request.keep_alive());
+        response.body() = std::move(body);
+        response.prepare_payload();
+        return response;
+    }
+
+    RouteResult Route(const http::request<http::string_body>& request,
+                      asio::any_io_executor executor) {
+        if (!IsOriginAllowed(request)) {
+            return {MakeResponse(request, http::status::forbidden,
+                                 JsonRpcError(-32600, "Invalid Origin"))};
+        }
+
+        const auto path = RequestPath(request);
+        if (path == "/health" && request.method() == http::verb::get) {
+            return {MakeResponse(request, http::status::ok,
+                R"({"status":"ok","transport":"streamable-http","version":"2.0.0"})")};
+        }
+        if (path != endpoint_) {
+            return {MakeResponse(request, http::status::not_found,
+                                 JsonRpcError(-32601, "Endpoint not found"))};
+        }
+        if (request.method() == http::verb::options) {
+            auto response = MakeResponse(request, http::status::no_content, "", "text/plain");
+            return {std::move(response)};
+        }
+        if (request.method() == http::verb::post) return RoutePost(request, std::move(executor));
+        if (request.method() == http::verb::get) return RouteLegacyGet(request, std::move(executor));
+        if (request.method() == http::verb::delete_) return RouteLegacyDelete(request);
+
+        auto response = MakeResponse(request, http::status::method_not_allowed,
+                                     JsonRpcError(-32600, "Method not allowed"));
+        response.set(http::field::allow, "POST, GET, DELETE, OPTIONS");
+        return {std::move(response)};
+    }
+
+    RouteResult RoutePost(const http::request<http::string_body>& request,
+                          asio::any_io_executor executor) {
+        const std::string content_type(request[http::field::content_type]);
+        if (!ContainsToken(content_type, "application/json")) {
+            return {MakeResponse(request, http::status::unsupported_media_type,
+                                 JsonRpcError(-32600, "Content-Type must be application/json"))};
+        }
+
+        json payload;
+        try {
+            payload = json::parse(request.body());
+        } catch (const json::exception&) {
+            return {MakeResponse(request, http::status::bad_request,
+                                 JsonRpcError(-32700, "Parse error"))};
+        }
+        const json request_id = payload.is_object() && payload.contains("id")
+                                    ? payload["id"] : json(nullptr);
+        if (!payload.is_object() || payload.value("jsonrpc", "") != "2.0" ||
+            !payload.contains("method") || !payload["method"].is_string()) {
+            return {MakeResponse(request, http::status::bad_request,
+                                 JsonRpcError(-32600, "Invalid JSON-RPC message", request_id))};
+        }
+
+        const std::string method = payload["method"].get<std::string>();
+        const std::string protocol(request["MCP-Protocol-Version"]);
+        const bool modern = protocol == "2026-07-28";
+        const bool legacy = protocol.empty() || protocol == "2025-03-26" ||
+                            protocol == "2025-06-18" || protocol == "2025-11-25";
+        if (!modern && !legacy) {
+            json data = {{"supportedVersions",
+                          {"2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"}}};
+            return {MakeResponse(request, http::status::bad_request,
+                JsonRpcError(-32022, "Unsupported protocol version", request_id, data))};
+        }
+
+        const std::string accept(request[http::field::accept]);
+        if (modern && (!ContainsToken(accept, "application/json") ||
+                       !ContainsToken(accept, "text/event-stream"))) {
+            return {MakeResponse(request, http::status::not_acceptable,
+                JsonRpcError(-32600,
+                    "Accept must include application/json and text/event-stream", request_id))};
+        }
+
+        std::string legacy_session_id;
+        if (modern) {
+            if (method == "initialize") {
+                return {MakeResponse(request, http::status::not_found,
+                    JsonRpcError(-32601, "Method not found", request_id))};
+            }
+            if (!ValidateModernHeaders(request, payload)) {
+                return {MakeResponse(request, http::status::bad_request,
+                    JsonRpcError(-32023, "Request metadata headers do not match body", request_id))};
+            }
+        } else if (method == "initialize") {
+            legacy_session_id = MakeToken();
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            sessions_.emplace(legacy_session_id, LegacySession{legacy_session_id, {}});
+        } else {
+            legacy_session_id = std::string(request["Mcp-Session-Id"]);
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            if (legacy_session_id.empty()) {
+                return {MakeResponse(request, http::status::bad_request,
+                    JsonRpcError(-32600, "Missing Mcp-Session-Id", request_id))};
+            }
+            if (!sessions_.contains(legacy_session_id)) {
+                return {MakeResponse(request, http::status::not_found,
+                    JsonRpcError(-32600, "Unknown or expired session", request_id))};
+            }
+        }
+
+        const bool notification = !payload.contains("id");
+        if (notification) {
+            Enqueue({request.body().size(), request.body(), {}, {}});
+            auto response = MakeResponse(request, http::status::accepted, "", "text/plain");
+            if (!legacy_session_id.empty()) response.set("Mcp-Session-Id", legacy_session_id);
+            return {std::move(response)};
+        }
+
+        const auto exchange_id = NextExchangeId();
+        auto channel = std::make_shared<ResponseQueue>(
+            std::move(executor), exchange_id, legacy_session_id, modern);
+
+        if (modern && method == "subscriptions/listen") {
+            SubscriptionFilter filter;
+            if (!ParseSubscriptionFilter(payload, request_id, filter)) {
+                channel->Close();
+                return {MakeResponse(request, http::status::bad_request,
+                    JsonRpcError(-32602, "Invalid subscription filter", request_id))};
+            }
+            const auto acknowledged_notifications = filter.AcknowledgedNotifications();
+            {
+                std::lock_guard<std::mutex> lock(pending_mutex_);
+                if (subscriptions_.size() >= kMaxPendingExchanges) {
+                    channel->Close();
+                    return {MakeResponse(request, http::status::service_unavailable,
+                        JsonRpcError(-32603, "Server is busy", request_id))};
+                }
+                subscriptions_.emplace(
+                    exchange_id, Subscription{channel, std::move(filter)});
+            }
+            json acknowledged = {
+                {"jsonrpc", "2.0"},
+                {"method", "notifications/subscriptions/acknowledged"},
+                {"params", {
+                    {"notifications", acknowledged_notifications}
+                }}
+            };
+            channel->Push({acknowledged.dump(), exchange_id, false});
+            return {{}, std::move(channel), true, true};
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            if (pending_.size() >= kMaxPendingExchanges) {
+                channel->Close();
+                return {MakeResponse(request, http::status::service_unavailable,
+                    JsonRpcError(-32603, "Server is busy", request_id))};
+            }
+            pending_[exchange_id] = channel;
+        }
+        Enqueue({request.body().size(), request.body(), exchange_id,
+                 channel->CancellationFlag()});
+
+        const bool sse = modern
+            ? method == "tools/call"
+            : ContainsToken(accept, "text/event-stream") &&
+              !ContainsToken(accept, "application/json");
+        return {{}, std::move(channel), sse, false};
+    }
+
+    RouteResult RouteLegacyGet(const http::request<http::string_body>& request,
+                               asio::any_io_executor executor) {
+        const std::string protocol(request["MCP-Protocol-Version"]);
+        if (protocol == "2026-07-28") {
+            return {MakeResponse(request, http::status::method_not_allowed,
+                                 JsonRpcError(-32600, "GET is not supported by MCP 2026-07-28"))};
+        }
+        if (!ContainsToken(std::string(request[http::field::accept]), "text/event-stream")) {
+            return {MakeResponse(request, http::status::not_acceptable,
+                                 JsonRpcError(-32600, "Accept must include text/event-stream"))};
+        }
+        const std::string session_id(request["Mcp-Session-Id"]);
+        const auto exchange_id = NextExchangeId();
+        auto channel = std::make_shared<ResponseQueue>(
+            std::move(executor), exchange_id, session_id);
+        {
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            const auto it = sessions_.find(session_id);
+            if (it == sessions_.end()) {
+                return {MakeResponse(request, http::status::not_found,
+                                     JsonRpcError(-32600, "Unknown or expired session"))};
+            }
+            if (auto previous = it->second.notification_stream.lock()) previous->Close();
+            it->second.notification_stream = channel;
+        }
+        return {{}, std::move(channel), true, true};
+    }
+
+    RouteResult RouteLegacyDelete(const http::request<http::string_body>& request) {
+        const std::string protocol(request["MCP-Protocol-Version"]);
+        if (protocol == "2026-07-28") {
+            return {MakeResponse(request, http::status::method_not_allowed,
+                                 JsonRpcError(-32600, "DELETE is not supported by MCP 2026-07-28"))};
+        }
+        const std::string session_id(request["Mcp-Session-Id"]);
+        std::shared_ptr<ResponseQueue> stream;
+        {
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            const auto it = sessions_.find(session_id);
+            if (it == sessions_.end()) {
+                return {MakeResponse(request, http::status::not_found,
+                                     JsonRpcError(-32600, "Unknown or expired session"))};
+            }
+            stream = it->second.notification_stream.lock();
+            sessions_.erase(it);
+        }
+        if (stream) stream->Close();
+        return {MakeResponse(request, http::status::ok,
+                             R"({"status":"session terminated"})")};
+    }
+
+    bool ValidateModernHeaders(const http::request<http::string_body>& request,
+                               const json& payload) const {
+        const std::string method = payload["method"].get<std::string>();
+        if (std::string(request["Mcp-Method"]) != method) return false;
+
+        if (!payload.contains("params") || !payload["params"].is_object()) return false;
+        const auto& params = payload["params"];
+        if (!params.contains("_meta") || !params["_meta"].is_object()) return false;
+        const auto& meta = params["_meta"];
+        const auto version_it = meta.find("io.modelcontextprotocol/protocolVersion");
+        if (version_it == meta.end() || !version_it->is_string() ||
+            version_it->get<std::string>() != "2026-07-28") return false;
+        if (!meta.contains("io.modelcontextprotocol/clientInfo") ||
+            !meta["io.modelcontextprotocol/clientInfo"].is_object() ||
+            !meta.contains("io.modelcontextprotocol/clientCapabilities") ||
+            !meta["io.modelcontextprotocol/clientCapabilities"].is_object()) return false;
+
+        std::optional<std::string> expected_name;
+        if (method == "tools/call" || method == "prompts/get") {
+            if (params.contains("name") && params["name"].is_string()) {
+                expected_name = params["name"].get<std::string>();
+            }
+        } else if (method == "resources/read") {
+            if (params.contains("uri") && params["uri"].is_string()) {
+                expected_name = params["uri"].get<std::string>();
+            }
+        }
+        if ((method == "tools/call" || method == "prompts/get" ||
+             method == "resources/read") && !expected_name) return false;
+        if (expected_name) {
+            auto actual = DecodeHeaderValue(std::string(request["Mcp-Name"]));
+            if (!actual || *actual != *expected_name) return false;
         }
         return true;
     }
 
-    // =========================================================================
-    // Static Utility Methods
-    // =========================================================================
+    bool ParseSubscriptionFilter(const json& payload,
+                                 const json& request_id,
+                                 SubscriptionFilter& result) const {
+        if (!payload.contains("params") || !payload["params"].is_object()) return false;
+        const auto& params = payload["params"];
+        if (!params.contains("notifications") ||
+            !params["notifications"].is_object()) return false;
 
-    bool StreamableTransport::ClientAcceptsSSE(const httplib::Request& req) {
-        auto accept = req.get_header_value("Accept");
-        if (accept.empty()) {
+        const auto& notifications = params["notifications"];
+        const auto read_flag = [&notifications](std::string_view name,
+                                                bool& destination) {
+            const auto it = notifications.find(std::string(name));
+            if (it == notifications.end()) return true;
+            if (!it->is_boolean()) return false;
+            destination = it->get<bool>();
+            return true;
+        };
+        if (!read_flag("toolsListChanged", result.tools_list_changed) ||
+            !read_flag("promptsListChanged", result.prompts_list_changed) ||
+            !read_flag("resourcesListChanged", result.resources_list_changed)) {
             return false;
         }
-        // Client wants SSE if Accept header contains text/event-stream
-        return accept.find("text/event-stream") != std::string::npos;
+
+        const auto resources = notifications.find("resourceSubscriptions");
+        if (resources != notifications.end()) {
+            if (!resources->is_array()) return false;
+            for (const auto& uri : *resources) {
+                if (!uri.is_string()) return false;
+                const auto value = uri.get<std::string>();
+                if (std::find(result.resource_subscriptions.begin(),
+                              result.resource_subscriptions.end(), value) ==
+                    result.resource_subscriptions.end()) {
+                    result.resource_subscriptions.push_back(value);
+                }
+            }
+        }
+        result.request_id = request_id;
+        return true;
     }
 
-    std::string StreamableTransport::FormatSSEEvent(const std::string& data) {
-        // Strictly follow MCP SSE spec: event: message + data: {json}
-        return "event: message\ndata: " + data + "\n\n";
+    std::optional<std::string> PrepareSubscriptionNotification(
+        const std::string& data,
+        const SubscriptionFilter& filter) const {
+        try {
+            auto notification = json::parse(data);
+            if (!notification.is_object() ||
+                notification.value("jsonrpc", "") != "2.0" ||
+                !notification.contains("method") ||
+                !notification["method"].is_string()) return std::nullopt;
+
+            const auto method = notification["method"].get<std::string>();
+            bool matches =
+                (method == "notifications/tools/list_changed" &&
+                 filter.tools_list_changed) ||
+                (method == "notifications/prompts/list_changed" &&
+                 filter.prompts_list_changed) ||
+                (method == "notifications/resources/list_changed" &&
+                 filter.resources_list_changed);
+            if (method == "notifications/resources/updated") {
+                if (!notification.contains("params") ||
+                    !notification["params"].is_object() ||
+                    !notification["params"].contains("uri") ||
+                    !notification["params"]["uri"].is_string()) {
+                    return std::nullopt;
+                }
+                const auto uri = notification["params"]["uri"].get<std::string>();
+                matches = std::find(filter.resource_subscriptions.begin(),
+                                    filter.resource_subscriptions.end(), uri) !=
+                          filter.resource_subscriptions.end();
+            }
+            if (!matches) return std::nullopt;
+
+            if (!notification.contains("params") ||
+                !notification["params"].is_object()) {
+                notification["params"] = json::object();
+            }
+            auto& params = notification["params"];
+            if (!params.contains("_meta") || !params["_meta"].is_object()) {
+                params["_meta"] = json::object();
+            }
+            params["_meta"]["io.modelcontextprotocol/subscriptionId"] =
+                filter.request_id;
+            return notification.dump();
+        } catch (const json::exception&) {
+            return std::nullopt;
+        }
     }
 
-    void StreamableTransport::HandleOptionsRequest(const httplib::Request& /*req*/, httplib::Response& res) {
-        SetCORSHeaders(res);
-        res.status = 200;
+    http::status HttpStatusForResponse(const std::string& data, bool modern) const {
+        if (!modern) return http::status::ok;
+        try {
+            const auto response = json::parse(data);
+            if (response.is_object() && response.contains("error") &&
+                response["error"].is_object() &&
+                response["error"].value("code", 0) == -32601) {
+                return http::status::not_found;
+            }
+        } catch (const json::exception&) {}
+        return http::status::ok;
     }
 
-    void StreamableTransport::SetCORSHeaders(httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        res.set_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-        res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization, MCP-Session-Id");
-        res.set_header("Access-Control-Expose-Headers", "Content-Type, MCP-Session-Id");
-        res.set_header("Access-Control-Max-Age", "86400");
+    std::string NormalizeResponse(const std::string& data, bool modern) const {
+        if (!modern) return data;
+        try {
+            auto response = json::parse(data);
+            if (response.is_object() && response.contains("result") &&
+                response["result"].is_object() &&
+                !response["result"].contains("resultType")) {
+                response["result"]["resultType"] = "complete";
+                return response.dump();
+            }
+        } catch (const json::exception&) {
+            // Preserve custom handler output; the client will receive the
+            // original payload rather than a transport-generated replacement.
+        }
+        return data;
     }
+
+    void Enqueue(TransportMessage message) {
+        if (!running_.load()) return;
+        {
+            std::lock_guard<std::mutex> lock(incoming_mutex_);
+            incoming_.push(std::move(message));
+        }
+        incoming_cv_.notify_one();
+    }
+
+    void Broadcast(const std::string& data) {
+        std::vector<std::pair<std::shared_ptr<ResponseQueue>, std::string>> targets;
+        {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            for (auto it = subscriptions_.begin(); it != subscriptions_.end();) {
+                if (auto channel = it->second.channel.lock()) {
+                    auto message = PrepareSubscriptionNotification(data, it->second.filter);
+                    if (message) {
+                        targets.emplace_back(std::move(channel), std::move(*message));
+                    }
+                    ++it;
+                } else {
+                    it = subscriptions_.erase(it);
+                }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            for (auto& [_, session] : sessions_) {
+                if (auto channel = session.notification_stream.lock()) {
+                    targets.emplace_back(std::move(channel), data);
+                }
+            }
+        }
+        for (auto& [channel, message] : targets) {
+            channel->Push({std::move(message), channel->ExchangeId(), false});
+        }
+    }
+
+    void Unregister(const std::string& exchange_id) {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        pending_.erase(exchange_id);
+        subscriptions_.erase(exchange_id);
+    }
+
+    std::string NextExchangeId() {
+        return MakeToken() + '-' + std::to_string(++exchange_counter_);
+    }
+
+    int port_;
+    std::string host_;
+    std::string endpoint_;
+    asio::io_context ioc_;
+    std::unique_ptr<tcp::acceptor> acceptor_;
+    std::vector<std::thread> io_threads_;
+    std::atomic<bool> running_{false};
+    std::atomic<std::uint64_t> exchange_counter_{0};
+
+    std::queue<TransportMessage> incoming_;
+    std::mutex incoming_mutex_;
+    std::condition_variable incoming_cv_;
+
+    std::unordered_map<std::string, std::weak_ptr<ResponseQueue>> pending_;
+    std::unordered_map<std::string, Subscription> subscriptions_;
+    std::mutex pending_mutex_;
+
+    std::unordered_map<std::string, LegacySession> sessions_;
+    std::mutex session_mutex_;
+};
+
+StreamableTransport::StreamableTransport(int port, std::string host, std::string endpoint)
+    : port_(port),
+      host_(std::move(host)),
+      endpoint_(std::move(endpoint)),
+      impl_(std::make_unique<Impl>(port_, host_, endpoint_)) {}
+
+StreamableTransport::~StreamableTransport() = default;
+
+bool StreamableTransport::Start() { return impl_->Start(); }
+void StreamableTransport::Stop() { impl_->Stop(); }
+bool StreamableTransport::IsRunning() { return impl_->IsRunning(); }
+size_t StreamableTransport::GetConcurrency() const {
+    return std::max(2u, std::thread::hardware_concurrency());
+}
+
+TransportMessage StreamableTransport::ReadMessage() { return impl_->ReadMessage(); }
+
+void StreamableTransport::WriteMessage(const TransportWrite& message) {
+    impl_->WriteMessage(message);
+}
+
+std::future<TransportMessage> StreamableTransport::ReadMessageAsync() {
+    return std::async(std::launch::async, [this]() { return ReadMessage(); });
+}
+
+std::pair<size_t, std::string> StreamableTransport::Read() {
+    auto message = ReadMessage();
+    return {message.length, std::move(message.data)};
+}
+
+void StreamableTransport::Write(const std::string& json_data) {
+    impl_->WriteMessage({json_data, {}, false});
+}
+
+std::future<std::pair<size_t, std::string>> StreamableTransport::ReadAsync() {
+    return std::async(std::launch::async, [this]() { return Read(); });
+}
+
+std::future<void> StreamableTransport::WriteAsync(const std::string& json_data) {
+    return std::async(std::launch::async, [this, json_data]() { Write(json_data); });
+}
 
 } // namespace vx::transport

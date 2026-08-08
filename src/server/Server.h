@@ -46,9 +46,11 @@ namespace vx::mcp {
         void SendNotification(const std::string& pluginName, const char* notification);
     private:
         void WriterLoop();
+        void ProcessMessage(TransportMessage message);
         json HandleRequest(const json& request);
 
         json InitializeCmd(const json& request);
+        json ServerDiscoverCmd(const json& request);
         json PingCmd(const json& request);
         json NotificationInitializedCmd(const json& request);
         json ToolsListCmd(const json& request);
@@ -80,7 +82,7 @@ namespace vx::mcp {
         std::atomic<bool> isCleaned_{false};
 
         int verboseLevel_ = 0;
-        int parserErrors_ = 0;
+        std::atomic<int> parserErrors_{0};
         std::string name_ = "mcp-server";
 
         std::shared_ptr<ITransport> transport_;
@@ -91,6 +93,10 @@ namespace vx::mcp {
         std::thread reader_thread_;
         std::atomic<bool> writer_running_ = false;
         std::atomic<bool> reader_running_ = false;
+
+        // Set while a request is executing so synchronous plugin notifications
+        // can be routed to that request's response stream instead of broadcast.
+        static thread_local std::string active_exchange_id_;
     };
 }
 

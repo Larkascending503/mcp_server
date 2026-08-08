@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.20.0)
+if(POLICY CMP0167)
+    cmake_policy(SET CMP0167 NEW)
+endif()
 project(mcp_server)
+
+include(CTest)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -15,6 +20,7 @@ configure_file(
 )
 
 find_package(Threads REQUIRED)
+find_package(Boost 1.81 REQUIRED)
 
 # for ASAN
 option(USE_ASAN "Enable AddressSanitizer for memory debugging" OFF)
@@ -49,7 +55,8 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}
 )
 
-target_link_libraries(${PROJECT_NAME} PRIVATE Threads::Threads)
+target_link_libraries(${PROJECT_NAME} PRIVATE Threads::Threads Boost::headers)
+target_compile_definitions(${PROJECT_NAME} PRIVATE BOOST_ERROR_CODE_HEADER_ONLY)
 
 if(CMAKE_COMPILER_IS_GNUCC OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     if(UNIX AND NOT APPLE)
@@ -61,3 +68,14 @@ add_subdirectory(plugins/sleep)
 add_subdirectory(plugins/notification)
 add_subdirectory(plugins/weather)
 add_subdirectory(plugins/code-review)
+
+if(BUILD_TESTING)
+    add_test(
+        NAME streamable_http_integration
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/streamable_http_integration.sh" $<TARGET_FILE:mcp_server>
+    )
+    set_tests_properties(streamable_http_integration PROPERTIES
+        TIMEOUT 30
+        RUN_SERIAL TRUE
+    )
+endif()

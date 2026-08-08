@@ -46,6 +46,8 @@ int main(int argc, char** argv){
     std::string plugins_directory;
     std::string logs_directory;
     bool verbose = false;
+    std::string listen_address = "127.0.0.1";
+    int listen_port = 8080;
 
     std::shared_ptr<vx::ITransport> transport;
     loader = std::make_shared<vx::mcp::PluginsLoader>();
@@ -61,11 +63,15 @@ int main(int argc, char** argv){
     auto verbose_option = op.add<Value<bool>>("v", "verbose", "enable verbose", verbose);
     auto use_see_server = op.add<Switch>("s", "see", "start as see server");
     auto use_httpstream_server = op.add<Switch>("t", "httpstream", "start as httpstream server");
-    auto use_streamable_server = op.add<Switch>("m", "streamable", "start as streamable HTTP server (MCP 2025-03-26)");
+    auto use_streamable_server = op.add<Switch>("m", "streamable", "start as Streamable HTTP server (MCP 2026-07-28 + legacy)");
+    auto listen_address_option = op.add<Value<std::string>>("a", "address", "Streamable HTTP bind address", listen_address);
+    auto listen_port_option = op.add<Value<int>>("P", "port", "Streamable HTTP listen port", listen_port);
     name_option->assign_to(&name);
     verbose_option->assign_to(&verbose);
     plugins_directory_option->assign_to(&plugins_directory);
     logs_directory_option->assign_to(&logs_directory);
+    listen_address_option->assign_to(&listen_address);
+    listen_port_option->assign_to(&listen_port);
 
     try{
         op.parse(argc, argv);
@@ -86,7 +92,7 @@ int main(int argc, char** argv){
     } else if(use_httpstream_server->is_set()){
         transport = std::make_shared<vx::transport::HttpStream>();
     } else if(use_streamable_server->is_set()){
-        transport = std::make_shared<vx::transport::StreamableTransport>();
+        transport = std::make_shared<vx::transport::StreamableTransport>(listen_port, listen_address);
     } else {
         transport = std::make_shared<vx::transport::Stdio>();
     }

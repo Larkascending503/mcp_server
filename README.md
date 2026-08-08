@@ -1,6 +1,6 @@
 # CPP MCP-SERVER
 
-一个基于 C++ 实现的模型上下文协议（Model Context Protocol）服务器，采用插件架构设计，支持多种传输协议（包括 MCP 2025-03-26 规范的 Streamable HTTP），具备运行时插件热插拔能力。
+一个基于 C++ 实现的模型上下文协议（Model Context Protocol）服务器，采用插件架构设计，支持多种传输协议（包括 MCP 2026-07-28 及 2025 兼容模式的 Streamable HTTP），具备运行时插件热插拔能力。
 
 ## 项目架构
 
@@ -56,7 +56,7 @@ mcp_server/
 │   │   ├── StdioTransport.h/cpp          标准输入输出传输（默认）
 │   │   ├── SSETransport.h/cpp            SSE 传输（长轮询）
 │   │   ├── HttpStreamTransport.hpp/cpp   HTTP 流式传输（会话制）
-│   │   └── StreamableTransport.h/cpp     Streamable HTTP 传输（MCP 2025-03-26 规范）
+│   │   └── StreamableTransport.h/cpp     Boost.Beast Streamable HTTP 传输（新版 + legacy）
 │   │
 │   ├── loader/                     插件加载与热插拔
 │   │   ├── PluginsLoader.h         PluginEntry 生命周期结构体、PluginsLoader 类
@@ -123,16 +123,17 @@ Server 内部有一个独立的 **Writer 线程**，负责从通知队列中取�
 | **Stdio**           | stdin/stdout                                                | 无   | Claude Desktop 等本地客户端  | —              |
 | **HTTP Stream**     | POST(Client请求+Server应答) + GET SSE(通知) + 会话管理      | 8080 | REST API 客户端              | 2024-11-05     |
 | **SSE**             | POST(Client请求) + GET SSE(Server应答+通知)                 | 8080 | 长轮询客户端                 | —              |
-| **Streamable HTTP** | POST(动态JSON/SSE响应) + GET SSE(通知) + DELETE(会话) + 会话管理 | 8080 | MCP 标准客户端               | **2025-03-26** |
+| **Streamable HTTP** | 新版无状态 POST + 请求级 SSE；兼容旧版 GET/DELETE/Session | 8080 | MCP 标准客户端 | **2026-07-28 + 2025 legacy** |
 
-> **Streamable HTTP** 是 MCP 2025-03-26 规范推荐的传输方式，支持根据客户端 `Accept` 头动态切换 JSON 响应和 SSE 流式响应。详见 [StreamableHTTP技术实现文档.md](Docs/StreamableHTTP技术实现文档.md)。
+> 新版默认绑定 `127.0.0.1`，使用 Boost.Asio/Beast 异步网络层。2026-07-28 请求无会话；旧客户端会自动进入 2025 session 兼容路径。
 
 通过命令行参数选择：
 ```bash
 ./mcp_server                   # 默认 Stdio
 ./mcp_server -t                # HTTP Stream
 ./mcp_server -s                # SSE
-./mcp_server -m                # Streamable HTTP（推荐）
+./mcp_server -m                # Streamable HTTP（默认仅本机访问）
+./mcp_server -m -a 0.0.0.0     # 显式允许局域网访问（生产环境应配置鉴权）
 ```
 
 ### PluginsLoader（插件管理与热插拔）
@@ -178,17 +179,23 @@ void DestroyPlugin(PluginAPI*); // 销毁插件实例
 | 平台         | 编译器  |
 | ------------ | ------- |
 | Ubuntu Linux | GCC     |
-| Mac OS       | GCC     |
+| macOS        | Apple Clang |
 
 ## 如何编译
 
 ```bash
 git clone <your-repo-url>
 cd mcp_server
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
+
+# macOS
+brew install cmake ninja boost
+
+cmake -S . -B build -G Ninja
+cmake --build build
+ctest --test-dir build --output-on-failure
 ```
+
+Linux 需要 C++20 编译器、CMake 3.20+、Ninja（或 Make）、Boost 1.81+ 和 pthread。
 
 编译产物：
 - `build/mcp_server` — 服务器可执行文件
@@ -203,7 +210,9 @@ make -j$(nproc)
 | `-l, --logs`           | 日志目录路径（**目录必须存在**） | `./logs`     |
 | `-v, --verbose`        | 启用详细日志                     | `false`      |
 | `-t, --httpstream`     | 使用 HTTP Stream 传输            | —            |
-| `-m, --streamable`     | 使用 Streamable HTTP 传输（MCP 2025-03-26） | —            |
+| `-m, --streamable`     | 使用 Streamable HTTP（2026-07-28 + legacy） | —            |
+| `-a, --address`        | Streamable HTTP 监听地址                    | `127.0.0.1`  |
+| `-P, --port`           | Streamable HTTP 监听端口                    | `8080`       |
 
 ## Cursor 配置 (Streamable HTTP)
 
@@ -211,7 +220,7 @@ make -j$(nproc)
 {
   "mcpServers": {
     "my_mcp_server": {
-      "url": "http://192.168.139.107:8080/mcp",
+      "url": "http://127.0.0.1:8080/mcp",
       "headers": {
         "Accept": "application/json, text/event-stream",
         "Content-Type": "application/json"
@@ -245,18 +254,13 @@ make -j$(nproc)
 # 1. 健康检查
 curl -s http://localhost:8080/health
 
-# 2. 建立会话
+# 2. 最新协议发现（2026-07-28 无需建立会话）
 curl -s -D - -X POST http://localhost:8080/mcp \
   -H "Content-Type: application/json" \
-  -H "Accept: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}'
-
-# 3. 使用返回的 MCP-Session-Id 查询天气
-curl -s -X POST http://localhost:8080/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json" \
-  -H "MCP-Session-Id: <your-session-id>" \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_weather","arguments":{"latitude":"39.9042","longitude":"116.4074","city":"Beijing"}}}'
+  -H "Accept: application/json, text/event-stream" \
+  -H "MCP-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: server/discover" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"test","version":"1.0"},"io.modelcontextprotocol/clientCapabilities":{}}}}'
 ```
 
 完整测试用例参见 [StreamableHTTP测试文档.md](Docs/StreamableHTTP测试文档.md)。
@@ -272,4 +276,3 @@ Watcher 线程    每 5 秒扫描插件目录（热插拔启用时）
 ```
 
 三者通过 `shared_mutex`（插件列表）和 `mutex + condition_variable`（通知队列）协调。
-

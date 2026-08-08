@@ -1,14 +1,35 @@
 #include <iostream>
 #include <utility>
+#include <algorithm>
+#include <vector>
 #include "Server.h"
 #include "aixlog.hpp"
 #include "version.h"
 #include "../utils/MCPBuilder.h"
 
 namespace vx::mcp {
+    thread_local std::string Server::active_exchange_id_;
+
+    namespace {
+        class ExchangeScope {
+        public:
+            ExchangeScope(std::string& slot, const std::string& exchange_id)
+                : slot_(slot), previous_(slot) {
+                slot_ = exchange_id;
+            }
+
+            ~ExchangeScope() { slot_ = std::move(previous_); }
+
+        private:
+            std::string& slot_;
+            std::string previous_;
+        };
+    }
+
     Server::Server(){
         functionMap = {
             {"initialize", [this](const json& req){return this->InitializeCmd(req);}},
+            {"server/discover", [this](const json& req){return this->ServerDiscoverCmd(req);}},
             {"ping", [this](const json& req) { return this->PingCmd(req); }},
             {"resources/list", [this](const json& req) { return this->ResourcesListCmd(req); }},
             {"resources/read", [this](const json& req) { return this->ResourcesReadCmd(req); }},
@@ -85,39 +106,73 @@ namespace vx::mcp {
             return false;
         }
 
+        const auto concurrency = std::max<size_t>(1, transport_->GetConcurrency());
+        std::vector<std::future<void>> in_flight;
+        in_flight.reserve(concurrency);
+
         while(!isStopping_){
-            auto [length, json_string] = transport_->Read();
+            auto message = transport_->ReadMessage();
             if(isStopping_){
                 break;
             }
-            if(length == 0 && json_string.empty()){
+            if(message.length == 0 && message.data.empty()){
                 LOG(INFO) << "Transport closed" << std::endl;
                 isStopping_ = true;
                 break;
             }
-            try{
-                if(json_string.empty()) continue;
-                LOG(DEBUG) << "Received: " << json_string << std::endl;
-                json request = json::parse(json_string);
-                parserErrors_ = 0;
-                json response = HandleRequest(request);
-                if(response != nullptr){
-                    std::lock_guard<std::mutex> lock(output_mutex_);
-                    LOG(DEBUG) << "Sending: " << response.dump() << std::endl;
-                    transport_->Write(response.dump());
-                }
-            } catch(json::exception& e){
-                LOG(ERROR) << "JSON parse error: " << e.what() << std::endl;
-                if(++parserErrors_ > MAX_PARSE_ERRORS) return false;
-            } catch(const std::exception& e){
-                LOG(ERROR) << "Error: " << e.what() << std::endl;
-                isStopping_ = true;
-                break;
+
+            if (concurrency == 1) {
+                ProcessMessage(std::move(message));
+                continue;
             }
+
+            for (auto it = in_flight.begin(); it != in_flight.end();) {
+                if (it->wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+                    it->get();
+                    it = in_flight.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            if (in_flight.size() >= concurrency) {
+                in_flight.front().get();
+                in_flight.erase(in_flight.begin());
+            }
+            in_flight.emplace_back(std::async(std::launch::async,
+                [this, message = std::move(message)]() mutable {
+                    ProcessMessage(std::move(message));
+                }));
         }
+        for (auto& task : in_flight) task.get();
         Stop();
         return true;
     };
+
+    void Server::ProcessMessage(TransportMessage message) {
+        try {
+            if (message.data.empty()) return;
+            if (message.cancelled && message.cancelled->load()) return;
+
+            ExchangeScope exchange_scope(active_exchange_id_, message.exchange_id);
+            LOG(DEBUG) << "Received: " << message.data << std::endl;
+            json request = json::parse(message.data);
+            parserErrors_.store(0);
+            json response = HandleRequest(request);
+            if (response != nullptr &&
+                (!message.cancelled || !message.cancelled->load())) {
+                std::lock_guard<std::mutex> lock(output_mutex_);
+                LOG(DEBUG) << "Sending: " << response.dump() << std::endl;
+                transport_->WriteMessage({response.dump(), message.exchange_id, true});
+            }
+        } catch (const json::exception& e) {
+            LOG(ERROR) << "JSON parse error: " << e.what() << std::endl;
+            if (parserErrors_.fetch_add(1) + 1 > MAX_PARSE_ERRORS) {
+                isStopping_.store(true);
+            }
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Request processing error: " << e.what() << std::endl;
+        }
+    }
 
     bool Server::ConnectAsync(const std::shared_ptr<ITransport>& transport){
         if(!transport){
@@ -137,28 +192,16 @@ namespace vx::mcp {
             LOG(INFO) << "Starting reader thread" << std::endl;
             while(reader_running_ && !isStopping_){
                 try{
-                    auto future = transport_->ReadAsync();
-                    auto [length, json_string] = future.get();
-                    if (isStopping_ || (length == 0 && json_string.empty())) {
+                    auto future = transport_->ReadMessageAsync();
+                    auto message = future.get();
+                    if (isStopping_ || (message.length == 0 && message.data.empty())) {
                         LOG(INFO) << "Empty message or stopping. Reader exiting.";
                         break;
                     }
-
-                    if (!json_string.empty()) {
-                        LOG(DEBUG) << "Received: " << json_string << std::endl;
-                        json request = json::parse(json_string);
-                        parserErrors_ = 0;
-
-                        json response = HandleRequest(request);
-                        if (response != nullptr) {
-                            std::lock_guard<std::mutex> lock(output_mutex_);
-                            LOG(DEBUG) << "Sending Response: " << response.dump() << std::endl;
-                            transport_->Write(response.dump());
-                        }
-                    }
+                    ProcessMessage(std::move(message));
                 } catch (json::parse_error &e) {
                         LOG(ERROR) << "Error parsing JSON: " << e.what() << std::endl;
-                        if (++parserErrors_ > MAX_PARSE_ERRORS) {
+                        if (parserErrors_.fetch_add(1) + 1 > MAX_PARSE_ERRORS) {
                             isStopping_ = true;
                             break;
                         }
@@ -225,11 +268,20 @@ namespace vx::mcp {
         LOG(INFO) << "Async server stopped." << std::endl;
     }
 
-    void Server::SendNotification(const std::string& pluginName, const char* notification){
+    void Server::SendNotification(const std::string& /*pluginName*/, const char* notification){
         if(isStopping_){
             LOG(WARNING) << "Server is stopping, cannot send notifications." << std::endl;
             return;
         }
+
+        // Notifications emitted synchronously while handling a request belong to
+        // that request. Request-scoped routing is required by modern Streamable
+        // HTTP and also prevents one client's progress from leaking to another.
+        if (!active_exchange_id_.empty() && transport_) {
+            transport_->WriteMessage({notification, active_exchange_id_, false});
+            return;
+        }
+
         {
             std::lock_guard<std::mutex> lock(output_mutex_);
             notification_queue_.emplace(notification);
@@ -347,6 +399,25 @@ namespace vx::mcp {
         response["result"]["capabilities"]["logging"] = json::object();
         response["result"]["serverInfo"]["name"] = name_;
         response["result"]["serverInfo"]["version"] = PROJECT_VERSION;
+        return response;
+    }
+
+    json Server::ServerDiscoverCmd(const json& request) {
+        nlohmann::ordered_json response = {
+            {"jsonrpc", "2.0"},
+            {"id", request.value("id", json(nullptr))}
+        };
+        auto& result = response["result"];
+        result["supportedVersions"] = {
+            "2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"
+        };
+        result["capabilities"]["tools"] = json::object({{"listChanged", true}});
+        result["capabilities"]["prompts"] = json::object({{"listChanged", true}});
+        result["capabilities"]["resources"] = json::object({{"listChanged", true}});
+        result["capabilities"]["subscriptions"] = json::object();
+        result["_meta"]["io.modelcontextprotocol/serverInfo"] = {
+            {"name", name_}, {"version", PROJECT_VERSION}
+        };
         return response;
     }
 
